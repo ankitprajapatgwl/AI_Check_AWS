@@ -17,6 +17,7 @@ import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import case, func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
@@ -26,6 +27,7 @@ from src.db.models import (
     Attachment,
     Conversation,
     Email,
+    ImapPollState,
     Product,
     UnmatchedAttachment,
     UnmatchedEmail,
@@ -827,6 +829,116 @@ class Repository:
                 select(Email.id).where(Email.message_id == message_id).limit(1)
             )
             return result.scalar_one_or_none() is not None
+
+    async def unmatched_email_exists(self, message_id: str) -> bool:
+        """Return whether this ``Message-ID`` is already parked as unmatched.
+
+        The second half of the inbound idempotency guard. ``emails`` has a
+        UNIQUE ``message_id``, so a re-delivered *matched* reply can never
+        duplicate; ``unmatched_emails`` deliberately does not (an unmatched
+        message may legitimately be re-filed later), which means re-delivery
+        would otherwise append a fresh review row every time. The IMAP poller
+        re-delivers on any failure, so this is a routine case, not a rare one.
+
+        Args:
+            message_id (str): The RFC ``Message-ID`` to check.
+
+        Returns:
+            bool: ``True`` if that id is already parked for review.
+        """
+        if not message_id:
+            return False
+        async with self._session() as session:
+            result = await session.execute(
+                select(UnmatchedEmail.id)
+                .where(UnmatchedEmail.message_id == message_id)
+                .limit(1)
+            )
+            return result.scalar_one_or_none() is not None
+
+    # ── IMAP poll cursor ───────────────────────────────────────────────
+
+    async def get_imap_cursor(self, account: str, mailbox: str) -> dict | None:
+        """Return how far the poller has read one mailbox, if known.
+
+        Args:
+            account (str): The mailbox address being polled.
+            mailbox (str): The folder being polled, e.g. ``"INBOX"``.
+
+        Returns:
+            dict | None: ``{"uid_validity": str, "last_uid": int}``, or
+                ``None`` on the very first poll of this mailbox.
+        """
+        async with self._session() as session:
+            row = (
+                await session.execute(
+                    select(ImapPollState).where(
+                        ImapPollState.account == account,
+                        ImapPollState.mailbox == mailbox,
+                    )
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                return None
+            return {
+                "uid_validity": row.uid_validity,
+                "last_uid": int(row.last_uid or 0),
+            }
+
+    async def save_imap_cursor(
+        self, account: str, mailbox: str, *, uid_validity: str, last_uid: int
+    ) -> None:
+        """Advance (or reset) the poll cursor for one mailbox.
+
+        Written as an upsert so the first poll and every later one take the
+        same path, and so two replicas polling the same mailbox cannot race
+        into a duplicate-key error.
+
+        The cursor only ever moves forward *within* a ``UIDVALIDITY``
+        generation: a lower ``last_uid`` for the same generation is ignored,
+        which keeps a stale in-flight batch from rewinding a cursor another
+        poll already advanced. A changed generation replaces it outright,
+        since the old UIDs no longer mean anything.
+
+        Args:
+            account (str): The mailbox address being polled.
+            mailbox (str): The folder being polled.
+            uid_validity (str): The mailbox's current ``UIDVALIDITY``.
+            last_uid (int): Highest UID fully processed.
+
+        Returns:
+            None
+        """
+        async with self._session() as session:
+            statement = pg_insert(ImapPollState).values(
+                id=uuid.uuid4(),
+                account=account,
+                mailbox=mailbox,
+                uid_validity=uid_validity,
+                last_uid=last_uid,
+                updated_at=datetime.now(timezone.utc),
+            )
+            statement = statement.on_conflict_do_update(
+                constraint="uq_imap_poll_state_account_mailbox",
+                set_={
+                    "uid_validity": statement.excluded.uid_validity,
+                    "last_uid": statement.excluded.last_uid,
+                    "updated_at": statement.excluded.updated_at,
+                },
+                where=(
+                    (ImapPollState.uid_validity != statement.excluded.uid_validity)
+                    | (ImapPollState.last_uid < statement.excluded.last_uid)
+                ),
+            )
+            await session.execute(statement)
+            await session.commit()
+        self.log.debug(
+            "IMAP cursor %s/%s -> uid %s (validity %s)",
+            account,
+            mailbox,
+            last_uid,
+            uid_validity,
+        )
 
     async def get_all_users(self) -> list[dict]:
         async with self._session() as session:

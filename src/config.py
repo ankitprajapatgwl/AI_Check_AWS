@@ -313,6 +313,15 @@ class Settings:
                 os.getenv("POLL_INTERVAL_SECONDS", "30"),
             )
         )
+        # How far back to read on the *first* poll of a mailbox (or after the
+        # server renumbers it). Afterwards the stored UID cursor takes over
+        # and this is never consulted again, so it only bounds the initial
+        # catch-up: enough to pick up replies that arrived while the app was
+        # down, without replaying the mailbox's whole history. 0 = start from
+        # now and ignore everything already in the mailbox.
+        self.alibaba_imap_backfill_days = int(
+            os.getenv("ALIBABA_IMAP_BACKFILL_DAYS", "7")
+        )
 
         # ── Bedrock Availability POC (linked from the "/" landing page) ──
         # Full override for the "Check Bedrock" button's target URL. Leave

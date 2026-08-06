@@ -574,11 +574,16 @@ class ConversationService:
                 matched, or ``{"status": "matched", "user_id", "conv_id",
                 "matched_via", "action"}``.
         """
-        # Idempotency: IMAP re-polls anything not yet flagged and webhook
-        # providers retry on any non-2xx, so the same message arriving twice
-        # is routine.
-        if inbound.message_id and await self.db.email_exists(
-            inbound.message_id
+        # Idempotency: the IMAP poller re-delivers anything it could not
+        # finish (and overlaps its backfill window on a cold start), and
+        # webhook providers retry on any non-2xx, so the same message arriving
+        # twice is routine. Both destinations are checked — ``emails`` has a
+        # UNIQUE message_id but ``unmatched_emails`` deliberately does not, so
+        # without the second guard a re-delivered cold email would pile up a
+        # fresh review row per attempt.
+        if inbound.message_id and (
+            await self.db.email_exists(inbound.message_id)
+            or await self.db.unmatched_email_exists(inbound.message_id)
         ):
             self.log.info(
                 "Skipped duplicate inbound message %s", inbound.message_id
@@ -740,20 +745,35 @@ class ConversationService:
     def _detect_email_type(subject: str) -> str:
         """Detect whether an inbound email is a reply, forward, or new thread.
 
+        Forward prefixes are tested first: on ``"转发: Re: …"`` the outermost
+        action is what the message actually is.
+
+        Chinese webmail (Alibaba, 163, QQ) writes its prefixes with a
+        *fullwidth* colon — ``回复：``, not ``回复:`` — so the subject is
+        normalised before matching, or every Chinese-client reply would be
+        filed as a new thread.
+
         Args:
             subject (str): The subject line of the inbound email.
 
         Returns:
             str: One of ``"reply"``, ``"forwarded"``, or ``"new_thread"``.
+
+        Example:
+            >>> ConversationService._detect_email_type("转发：[RFQ - abc123]")
+            'forwarded'
+            >>> ConversationService._detect_email_type("回复：报价")
+            'reply'
         """
-        s = (subject or "").strip().lower()
-        if s.startswith("re:") or s.startswith("re ") or s.startswith("回复:"):
-            return "reply"
-        if (
-            s.startswith("fwd:")
-            or s.startswith("fw:")
-            or s.startswith("fwd ")
-            or s.startswith("转发:")
-        ):
+        s = (subject or "").strip().lower().replace("：", ":")
+        if s.startswith((
+            "fwd:", "fw:", "fwd ", "fw ",  # Western clients
+            "转发:", "轉發:", "转寄:",       # Chinese webmail (simplified / trad.)
+        )):
             return "forwarded"
+        if s.startswith((
+            "re:", "re ",                  # Western clients
+            "回复:", "回覆:", "答复:",       # Chinese webmail
+        )):
+            return "reply"
         return "new_thread"

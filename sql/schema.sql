@@ -185,3 +185,19 @@ CREATE TABLE IF NOT EXISTS unmatched_attachments (
 );
 
 CREATE INDEX IF NOT EXISTS ix_unmatched_attachments_email_id ON unmatched_attachments (unmatched_email_id);
+
+-- ── imap_poll_state ─────────────────────────────────────────────────────────
+-- The Alibaba IMAP poller's resume cursor. UIDs increase monotonically within
+-- a UIDVALIDITY generation, so (uid_validity, last_uid) is an exact record of
+-- "everything up to here has been ingested" that does not depend on the \Seen
+-- flag — a human opening the mailbox can no longer make inbound mail invisible
+-- to the poller.
+CREATE TABLE IF NOT EXISTS imap_poll_state (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    account       VARCHAR NOT NULL,
+    mailbox       VARCHAR NOT NULL,
+    uid_validity  VARCHAR NOT NULL,
+    last_uid      BIGINT NOT NULL DEFAULT 0,
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT uq_imap_poll_state_account_mailbox UNIQUE (account, mailbox)
+);

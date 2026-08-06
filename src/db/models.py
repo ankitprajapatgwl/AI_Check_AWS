@@ -11,11 +11,13 @@ from datetime import datetime, timezone
 
 from sqlalchemy import (
     ARRAY,
+    BigInteger,
     CheckConstraint,
     DateTime,
     ForeignKey,
     Numeric,
     Text,
+    UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -258,6 +260,45 @@ class UnmatchedEmail(Base):
         CheckConstraint(
             "status IN ('needs_review', 'resolved', 'ignored')",
             name="ck_unmatched_emails_status",
+        ),
+    )
+
+
+class ImapPollState(Base):
+    """How far the IMAP poller has read a mailbox — its resume cursor.
+
+    Alibaba Enterprise Mail has no inbound webhook, so replies are pulled by
+    :class:`~src.inbound.alibaba_imap_poller.AlibabaImapPoller`. That poller
+    used to treat the ``\\Seen`` flag as "already handled", which silently
+    lost every message a human (webmail preview pane, phone client) happened
+    to open before the next poll. This table replaces that flag with a
+    durable high-water mark: IMAP UIDs only ever increase within a
+    ``UIDVALIDITY`` generation, so ``last_uid`` plus a ``UID {last+1}:*``
+    search is an exact, read-state-independent definition of "new mail".
+
+    ``uid_validity`` is stored alongside because a server may renumber a
+    mailbox (restore, recreate), which invalidates every stored UID. When it
+    changes, the poller re-bootstraps instead of trusting a stale cursor.
+    """
+
+    __tablename__ = "imap_poll_state"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    # Mailbox identity, not region: the Singapore and Hong Kong access points
+    # front the same mailbox, so keying on (address, folder) keeps one shared
+    # cursor rather than two that would leapfrog each other.
+    account: Mapped[str]
+    mailbox: Mapped[str]
+    uid_validity: Mapped[str]
+    # UIDs are 32-bit unsigned per RFC 3501; BIGINT holds the whole range.
+    last_uid: Mapped[int] = mapped_column(BigInteger, default=0)
+    updated_at: Mapped[datetime] = mapped_column(default=_utcnow)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "account", "mailbox", name="uq_imap_poll_state_account_mailbox"
         ),
     )
 

@@ -101,9 +101,15 @@ class AlibabaWebhookParser(WebhookParserMaster):
             dkim=headers.get("authentication-results", ""),
             spf=headers.get("received-spf", ""),
             provider=self.provider_name,
-            message_id=headers.get("message-id", ""),
-            in_reply_to=headers.get("in-reply-to", ""),
-            references=headers.get("references", ""),
+            # Stripped because :mod:`email.policy.default` parses these as
+            # structured headers and keeps the folding whitespace that follows
+            # the colon — ``" <id@host>"``. ``message_id`` is the inbound
+            # idempotency key and gets stored verbatim, so a stray leading
+            # space would make the same message look different depending on
+            # which path delivered it.
+            message_id=headers.get("message-id", "").strip(),
+            in_reply_to=headers.get("in-reply-to", "").strip(),
+            references=headers.get("references", "").strip(),
             headers=headers,
             raw_message=raw,
         )
