@@ -27,6 +27,10 @@
 
       <input type="hidden" id="project_id" name="project_id">
       <input type="hidden" id="project_name_hidden" name="project_name">
+      {# Filled in by POST /draft once supplier + product are known, so the
+         conversation exists as a draft before this form is submitted. Empty
+         is fine: POST /send drafts inline when it's missing. #}
+      <input type="hidden" id="conv_id" name="conv_id">
 
       <div class="compose-card">
         <div class="compose-card-header">
@@ -37,7 +41,7 @@
           <div class="form-grid">
             <div class="form-group span2">
               <label for="provider_name">Provider</label>
-              <select id="provider_name" required onchange="updatePreview()">
+              <select id="provider_name" name="provider_name" required onchange="updatePreview()">
                 <option value="">— Select provider —</option>
                 {% for provider in available_providers %}
                   {% if provider.key=="engagelab" %}
@@ -47,7 +51,7 @@
                   {% endif %}
                 {% endfor %}
               </select>
-              <span class="label-hint">SendCloud/EngageLab support Chinese and Non-Chinese suppliers, SendGrid only Non-Chinese</span>
+              <span class="label-hint">SendCloud/EngageLab/Alibaba support Chinese and Non-Chinese suppliers — Chinese routes through the provider's Hong Kong region</span>
             </div>
           </div>
         </div>
@@ -156,7 +160,7 @@
         </div>
         <div class="preview-row">
           <div class="preview-label">Subject</div>
-          <div class="preview-subject" id="prev-subject">[RFQ-••••] Request for Quotation</div>
+          <div class="preview-subject" id="prev-subject">[RFQ - ••••••••] - Request for Quotation</div>
         </div>
 
         <div class="preview-divider"></div>
@@ -172,9 +176,9 @@
           </div>
         </div>
         <div class="preview-row">
-          <div class="preview-label">Reply address</div>
-          <div class="preview-value mono" id="prev-reply" style="font-size:11px; color:var(--txt2);">
-            Select a provider
+          <div class="preview-label">Reference</div>
+          <div class="preview-value mono" id="prev-reference" style="font-size:11px; color:var(--txt2);">
+            Assigned when the draft is created
           </div>
         </div>
       </div>
@@ -194,10 +198,11 @@
 <div style="margin-top: 24px; padding: 16px 20px; background: var(--card); border: 1px solid var(--border); border-radius: var(--r);">
   <div style="font-size: 13px; font-weight: 600; margin-bottom: 8px; color: var(--txt2);">How it works</div>
   <ol style="padding-left: 18px; font-size: 13px; color: var(--txt2); line-height: 1.8;">
-    <li>Pick the email provider to send through, and the supplier's type (Chinese / Non-Chinese) — SendCloud/EngageLab support both, routed through the matching region's URL/credentials, while SendGrid only supports Non-Chinese.</li>
-    <li>A unique email address is generated per conversation (encodes your name + a thread ID).</li>
-    <li>The RFQ is sent from that address — supplier replies come back to the same address.</li>
-    <li>The configured provider routes inbound replies to <code style="background:var(--bg);padding:1px 5px;border-radius:3px;">/webhooks/inbound</code>, which parses and stores the reply.</li>
+    <li>Pick the email provider to send through, and the supplier's type (Chinese / Non-Chinese) — SendCloud, EngageLab and Alibaba all support both, with Chinese suppliers routed through the provider's Hong Kong region.</li>
+    <li>Filling in the supplier and product creates the conversation as a <strong>draft</strong> and assigns its reference — before anything is sent.</li>
+    <li>The RFQ goes out with the subject <code style="background:var(--bg);padding:1px 5px;border-radius:3px;">[RFQ - id] - …</code> and its own <code style="background:var(--bg);padding:1px 5px;border-radius:3px;">Message-ID</code>; the draft becomes <strong>Open</strong>.</li>
+    <li>A reply is matched by <code style="background:var(--bg);padding:1px 5px;border-radius:3px;">In-Reply-To</code>/<code style="background:var(--bg);padding:1px 5px;border-radius:3px;">References</code>, falling back to the <code style="background:var(--bg);padding:1px 5px;border-radius:3px;">[RFQ - id]</code> subject prefix — so keeping the subject intact is all a supplier has to do. The conversation then becomes <strong>Closed</strong>.</li>
+    <li>Replies reach us at <code style="background:var(--bg);padding:1px 5px;border-radius:3px;">/webhooks/inbound/{provider}</code>, except Alibaba's, which are polled over IMAP.</li>
     <li>View the full conversation thread on the <a href="{{ base_path }}/tracking">Tracking</a> page.</li>
   </ol>
 </div>
@@ -206,6 +211,7 @@
   var fileInput = document.getElementById("attachments");
   var dropzone = document.getElementById("dropzone");
 
+  var BASE_PATH = {{ base_path | tojson }};
   var PROVIDER_DOMAINS = {
     {% for provider in available_providers %}
     "{{ provider.key }}": {{ provider.outbound_domain | tojson }}{{ "," if not loop.last }}
@@ -214,6 +220,18 @@
   var PROVIDER_SUPPORTED_TYPES = {
     {% for provider in available_providers %}
     "{{ provider.key }}": {{ provider.supported_types | tojson }}{{ "," if not loop.last }}
+    {% endfor %}
+  };
+  // Non-empty only for providers that send from one fixed mailbox (Alibaba);
+  // everyone else builds {CamelName}@{domain} per user.
+  var PROVIDER_FROM_PREVIEWS = {
+    {% for provider in available_providers %}
+    "{{ provider.key }}": {{ provider.from_address_preview | tojson }}{{ "," if not loop.last }}
+    {% endfor %}
+  };
+  var PROVIDER_REGION_HINTS = {
+    {% for provider in available_providers %}
+    "{{ provider.key }}": {{ provider.region_hints | tojson }}{{ "," if not loop.last }}
     {% endfor %}
   };
   var CURRENT_USER_NAME = {{ (current_user.full_name or "") | tojson }};
@@ -314,16 +332,25 @@
 
     var domain = providerName ? PROVIDER_DOMAINS[providerName] : "";
     var camelUser = camelName(CURRENT_USER_NAME);
+    var fixedFrom = providerName ? PROVIDER_FROM_PREVIEWS[providerName] : "";
 
+    // Alibaba can only send as its one authenticated mailbox, so it shows a
+    // fixed address; every other provider builds a per-user one.
     var fromEl = document.getElementById("prev-from");
-    fromEl.textContent = (providerName && domain)
-      ? camelUser + "@" + domain
-      : "Select a provider";
+    if (fixedFrom) {
+      fromEl.textContent = fixedFrom;
+    } else if (providerName && domain) {
+      fromEl.textContent = camelUser + "@" + domain;
+    } else {
+      fromEl.textContent = "Select a provider";
+    }
 
-    var replyEl = document.getElementById("prev-reply");
-    replyEl.textContent = (providerName && domain)
-      ? camelUser + "-{thread_id}@" + domain
-      : "Select a provider";
+    var referenceEl = document.getElementById("prev-reference");
+    var hints = (providerName && PROVIDER_REGION_HINTS[providerName]) || {};
+    var region = supplierType ? hints[supplierType] : "";
+    referenceEl.textContent = draftConvId
+      ? "[RFQ - " + draftConvId + "]" + (region ? " · " + region : "")
+      : (region || "Assigned when the draft is created");
 
     var warningEl = document.getElementById("type-mismatch-warning");
     var mismatch = providerName && supplierType &&
@@ -338,8 +365,13 @@
       toEl.innerHTML = '<span class="preview-value muted">Enter supplier details</span>';
     }
 
+    // Mirrors EmailMaster.build_rfq_subject exactly, so what's previewed is
+    // what goes on the wire (the real id replaces the placeholder as soon as
+    // the draft is created).
     var subjectEl = document.getElementById("prev-subject");
-    subjectEl.textContent = "[RFQ-••••] Request for Quotation" + (productName ? " — " + productName : "");
+    var base = supplierType === "chinese" ? "询价请求" : "Request for Quotation";
+    subjectEl.textContent = "[RFQ - " + (draftConvId || "••••••••") + "] - " +
+      base + (productName ? " — " + productName : "");
 
     var qtyEl = document.getElementById("prev-qty");
     if (quantity || targetPrice) {
@@ -353,6 +385,61 @@
     attEl.innerHTML = '<span class="preview-attachment-count">📎 ' + count +
       (count === 1 ? " file" : " files") + '</span>';
   }
+
+  // ── Draft-first (requirements 1 + 2) ──────────────────────────────
+  // Once the provider, supplier type, supplier email and product name are
+  // all filled in, POST /draft creates the conversation as a draft and
+  // returns its real id and subject, which the preview then shows. Only one
+  // draft is created per page load; POST /send reuses it. If this never
+  // fires (JS off, a validation error, a network blip), POST /send simply
+  // drafts inline instead — the ordering holds either way.
+  var draftConvId = "";
+  var draftInFlight = false;
+
+  function maybeCreateDraft() {
+    if (draftConvId || draftInFlight) return;
+
+    var providerName = document.getElementById("provider_name").value;
+    var supplierType = document.getElementById("supplier_type").value;
+    var supplierEmail = document.getElementById("supplier_email").value.trim();
+    var productName = document.getElementById("product_name").value.trim();
+    if (!providerName || !supplierType || !supplierEmail || !productName) return;
+    if (PROVIDER_SUPPORTED_TYPES[providerName].indexOf(supplierType) === -1) return;
+
+    draftInFlight = true;
+    var formData = new FormData();
+    formData.append("provider_name", providerName);
+    formData.append("supplier_type", supplierType);
+    formData.append("supplier_email", supplierEmail);
+    formData.append("supplier_name", document.getElementById("supplier_name").value.trim());
+    formData.append("product_name", productName);
+    formData.append("quantity", document.getElementById("quantity").value.trim());
+    formData.append("target_price", document.getElementById("target_price").value.trim());
+    formData.append("project_id", document.getElementById("project_id").value);
+    formData.append("project_name", document.getElementById("project_name_hidden").value);
+
+    fetch(BASE_PATH + "/draft", { method: "POST", body: formData })
+      .then(function (res) { return res.json(); })
+      .then(function (data) {
+        if (data && data.conv_id) {
+          draftConvId = data.conv_id;
+          document.getElementById("conv_id").value = data.conv_id;
+          if (data.subject) {
+            document.getElementById("prev-subject").textContent = data.subject;
+          }
+          updatePreview();
+        }
+      })
+      .catch(function () { /* POST /send drafts inline instead */ })
+      .finally(function () { draftInFlight = false; });
+  }
+
+  ["provider_name", "supplier_type", "supplier_email", "product_name"].forEach(
+    function (id) {
+      document.getElementById(id).addEventListener("blur", maybeCreateDraft);
+      document.getElementById(id).addEventListener("change", maybeCreateDraft);
+    }
+  );
 
   document.getElementById("rfq-form").addEventListener("submit", function (e) {
     if (!document.getElementById("supplier_email").value) {

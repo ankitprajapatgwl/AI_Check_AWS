@@ -68,12 +68,15 @@ class InboundEmail:
 
     A parser's :meth:`WebhookParserMaster.parse` returns this object so the
     service layer can process inbound mail without knowing which provider
-    produced it.
+    produced it. The Alibaba adapter builds one straight from a fetched MIME
+    message instead, since that inbound path is an IMAP poll rather than a
+    webhook — same object, same downstream pipeline.
 
     Attributes:
         from_email (str): Sender address.
-        to_email (str): Recipient (the dynamic conversation address).
-        subject (str): Subject line.
+        to_email (str): Recipient address.
+        subject (str): Subject line — carries the ``[RFQ - id]`` prefix when
+            the supplier left it intact, which is the fallback match.
         body_text (str): Plain-text body.
         body_html (str): HTML body.
         spam_score (float): Provider spam score (``0.0`` if not supplied).
@@ -83,6 +86,15 @@ class InboundEmail:
         signature_verified (bool): Whether the payload's authenticity was
             confirmed (always ``True`` for providers that do not sign).
         provider (str): The provider key that produced this payload.
+        message_id (str): The sender's own ``Message-ID`` — the inbound
+            idempotency key.
+        in_reply_to (str): Raw ``In-Reply-To`` header; the primary threading
+            signal.
+        references (str): Raw ``References`` header; the secondary one.
+        headers (dict[str, str]): All headers, lowercase-keyed, so
+            ``x-rfq-conversation-id`` can be read back when a client
+            preserved it.
+        raw_message (str): Full MIME source when the provider supplies one.
     """
 
     from_email: str = ""
@@ -96,6 +108,11 @@ class InboundEmail:
     attachments: list[RawAttachment] = field(default_factory=list)
     signature_verified: bool = True
     provider: str = ""
+    message_id: str = ""
+    in_reply_to: str = ""
+    references: str = ""
+    headers: dict[str, str] = field(default_factory=dict)
+    raw_message: str = ""
 
 
 class WebhookParserMaster(ABC):
@@ -178,6 +195,72 @@ class WebhookParserMaster(ABC):
         """
         return True
 
+    # ── Shared MIME helpers ──────────────────────────────────────────
+    # Every provider that hands us a raw ``.eml`` (EngageLab, SendCloud,
+    # SendGrid's header block, Alibaba's IMAP fetch) needs exactly these two
+    # walks, so they live here rather than being re-implemented per parser.
+
+    @staticmethod
+    def headers_from_mime(msg) -> dict[str, str]:
+        """Flatten an :mod:`email.message` object's headers into a dict.
+
+        Keys are lowercased so lookups are case-insensitive — mail servers
+        rewrite header casing freely, and this app reads
+        ``x-rfq-conversation-id`` back off inbound mail.
+
+        Args:
+            msg: An ``email.message.Message`` / ``EmailMessage``.
+
+        Returns:
+            dict[str, str]: Lowercase header name → value. On a repeated
+                header the last occurrence wins.
+
+        Example:
+            >>> import email
+            >>> msg = email.message_from_string("Subject: Hi\\n\\nbody")
+            >>> WebhookParserMaster.headers_from_mime(msg)["subject"]
+            'Hi'
+        """
+        headers: dict[str, str] = {}
+        for key, value in (msg.items() if msg is not None else []):
+            headers[str(key).lower()] = str(value)
+        return headers
+
+    @staticmethod
+    def attachments_from_mime(msg) -> list[RawAttachment]:
+        """Extract every attachment part from a parsed MIME message.
+
+        A part counts as an attachment if it is explicitly dispositioned as
+        one *or* simply carries a filename — some clients send inline-ish
+        parts with a name and no disposition, and dropping those loses real
+        files.
+
+        Args:
+            msg: An ``email.message.Message`` / ``EmailMessage``.
+
+        Returns:
+            list[RawAttachment]: One entry per decodable attachment part;
+                empty when the message carried none.
+        """
+        attachments: list[RawAttachment] = []
+        if msg is None:
+            return attachments
+        for part in msg.walk():
+            if (
+                part.get_content_disposition() != "attachment"
+                and not part.get_filename()
+            ):
+                continue
+            filename = part.get_filename() or "unnamed_attachment"
+            content_type = part.get_content_type() or "application/octet-stream"
+            # decode=True handles base64 / quoted-printable transparently.
+            content = part.get_payload(decode=True)
+            if content:
+                attachments.append(
+                    RawAttachment(filename, content_type, content)
+                )
+        return attachments
+
     def persist_attachments(
         self, conv_id: str, attachments: list[RawAttachment]
     ) -> list[dict]:
@@ -237,6 +320,26 @@ class WebhookParserMaster(ABC):
             })
             self.log.debug("Saved attachment %s", safe_name)
         return saved
+
+    def persist_unmatched_attachments(
+        self, attachments: list[RawAttachment]
+    ) -> list[dict]:
+        """Write the files from an unmatched inbound email to disk.
+
+        Same behaviour as :meth:`persist_attachments`, but namespaced
+        ``unmatched_{batch}_…`` because there is no conversation to file them
+        under yet (requirement 4, step 4). Naming them distinctly also keeps
+        them out of the ``{conv_id}_*`` glob that conversation deletion uses.
+
+        Args:
+            attachments (list[RawAttachment]): In-memory attachments from a
+                parsed inbound email.
+
+        Returns:
+            list[dict]: One metadata dict per saved file with keys
+                ``filename``, ``content_type``, ``size`` and ``url``.
+        """
+        return self.persist_attachments("unmatched", attachments)
 
     @staticmethod
     def _safe_filename(filename: str) -> str:

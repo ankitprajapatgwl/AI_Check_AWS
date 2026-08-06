@@ -9,9 +9,18 @@ Python SDK, so this mirrors the approach already used for
 :meth:`~src.services.conversation_service.ConversationService.send_rfq`
 builds it fresh per send via
 :meth:`~src.email_platform.email_master.EmailMaster.build_sending_email` on
-whichever provider the sender picked — and ``replyTo`` carries the dynamic
-conversation address so supplier replies route back through this app's
-webhook.
+whichever provider the sender picked. No ``replyTo`` is sent: replies thread
+on ``Message-ID``/``References`` and the ``[RFQ - id]`` subject prefix.
+
+.. warning::
+
+   SendCloud's custom-header support is **not documented** in this repo. The
+   ``headers`` form field this module sends the ``Message-ID`` through is a
+   best guess; the full send response is logged at DEBUG so a live send
+   confirms it. If SendCloud strips or rewrites the header, inbound matching
+   degrades to the subject token (still correct, just narrower). Confirm
+   against docs.aurorasendcloud.com and record the finding in
+   ``setup_docs/aurora_send_cloud/AuroraSendCloud_Documentation.md``.
 
 Configuration consumed (see :class:`src.config.Settings`):
 
@@ -21,7 +30,7 @@ Configuration consumed (see :class:`src.config.Settings`):
   (Singapore region).
 - ``SENDCLOUD_API_BASE`` – region base URL (Singapore by default).
 - ``SENDCLOUD_OUTBOUND_DOMAIN`` *(required)* – domain used to build the
-  ``From`` and dynamic Reply-To addresses for sends made through SendCloud.
+  ``From`` address for sends made through SendCloud.
 - ``SENDCLOUD_COMPANY_NAME`` – display name in the ``From`` header (defaults
   to ``"Your Company"``).
 
@@ -42,6 +51,7 @@ Example:
     'sendcloud'
 """
 
+import json
 import logging
 
 import requests
@@ -71,8 +81,8 @@ class SendCloudEmailProvider(EmailMaster):
         >>> result = provider.send_email(             # doctest: +SKIP
         ...     from_email="noreply@yourdomain.com", from_name="Acme",
         ...     to_email="buyer@x.com", to_name="Buyer",
-        ...     subject="Hi", html_body="<p>Hi</p>",
-        ...     reply_to="usr42_conv3fa9c1b2@mail.yourdomain.com")
+        ...     subject="[RFQ - hd273hsd] - Hi", html_body="<p>Hi</p>",
+        ...     message_id="<rfq.hd273hsd.ab@mail.yourdomain.com>")
         >>> result["provider"]                        # doctest: +SKIP
         'sendcloud'
     """
@@ -121,7 +131,8 @@ class SendCloudEmailProvider(EmailMaster):
         to_name: str,
         subject: str,
         html_body: str,
-        reply_to: str,
+        message_id: str,
+        extra_headers: dict[str, str] | None = None,
         attachments: list | None = None,
     ) -> dict:
         """Send one email via the SendCloud Basic Send API.
@@ -142,12 +153,16 @@ class SendCloudEmailProvider(EmailMaster):
                 accepted for interface parity).
             subject (str): Subject line.
             html_body (str): HTML body.
-            reply_to (str): Dynamic conversation address sent as
-                ``replyTo``.
+            message_id (str): The RFC ``Message-ID`` this app minted, sent
+                through the ``headers`` form field.
+            extra_headers (dict[str, str] | None): Extra headers merged into
+                the same field, e.g. ``X-RFQ-Conversation-Id``.
+            attachments (list | None): Optional attachments, uploaded as
+                multipart file parts.
 
         Returns:
             dict: ``{"status_code": int, "provider": "sendcloud",
-                "provider_message_id": str | None}``.
+                "provider_message_id": str | None, "message_id": str}``.
 
         Raises:
             EmailSendError: If the request fails at the network level, the
@@ -158,9 +173,9 @@ class SendCloudEmailProvider(EmailMaster):
             >>> provider.send_email(                   # doctest: +SKIP
             ...     from_email="noreply@yourdomain.com",
             ...     from_name="Acme", to_email="buyer@x.com",
-            ...     to_name="Buyer", subject="Hi",
+            ...     to_name="Buyer", subject="[RFQ - hd273hsd] - Hi",
             ...     html_body="<p>Hi</p>",
-            ...     reply_to="usr42_conv3fa9c1b2@mail.yourdomain.com")
+            ...     message_id="<rfq.hd273hsd.ab@mail.yourdomain.com>")
             {'status_code': 200, 'provider': 'sendcloud', ...}
         """
         data = {
@@ -169,9 +184,17 @@ class SendCloudEmailProvider(EmailMaster):
             "from": from_email,
             "fromName": from_name,
             "to": to_email,
-            "replyTo": reply_to,
             "subject": subject,
-            "html": html_body
+            "html": html_body,
+            # UNVERIFIED against docs.aurorasendcloud.com — SendCloud's
+            # custom-header support is undocumented in this repo, so this is
+            # a best guess at the field name/encoding. The response is logged
+            # in full on send so the first live send confirms or refutes it;
+            # if SendCloud drops or rewrites Message-ID, inbound matching
+            # simply falls back to the [RFQ - id] subject token.
+            "headers": json.dumps(
+                {"Message-ID": message_id, **(extra_headers or {})}
+            ),
         }
 
         files = [
@@ -228,17 +251,22 @@ class SendCloudEmailProvider(EmailMaster):
             )
 
         email_ids = body.get("info", {}).get("emailIdList") or []
-        message_id = email_ids[0] if email_ids else None
+        provider_message_id = email_ids[0] if email_ids else None
 
         self.log.info(
             "SendCloud accepted email to %s (status=%s)",
             to_email,
             body.get("statusCode"),
         )
+        # Logged in full (not just the id) so the first live send shows
+        # whether the "headers" field above was honoured — see the note on
+        # `data["headers"]`.
+        self.log.debug("SendCloud send response: %s", body)
         return {
             "status_code": body.get("statusCode", response.status_code),
             "provider": self.provider_name,
-            "provider_message_id": message_id,
+            "provider_message_id": provider_message_id,
+            "message_id": message_id,
         }
 
 

@@ -5,16 +5,17 @@ using the official :mod:`sendgrid` Python SDK. The ``From`` header is
 whatever address the caller passes in —
 :meth:`~src.services.conversation_service.ConversationService.send_rfq`
 builds it fresh per send via
-:meth:`~src.email_platform.email_master.EmailMaster.build_sending_email` —
-and the ``Reply-To`` header is the dynamic conversation address so that
-supplier replies are delivered back to SendGrid's Inbound Parse and
-forwarded to this app's webhook.
+:meth:`~src.email_platform.email_master.EmailMaster.build_sending_email`. No
+``Reply-To`` is set: supplier replies go back to that same ``From`` address
+(delivered to SendGrid's Inbound Parse and forwarded to this app's webhook)
+and are threaded by ``Message-ID``/``References`` plus the ``[RFQ - id]``
+subject prefix.
 
 Configuration consumed (see :class:`src.config.Settings`):
 
 - ``SENDGRID_API_KEY`` *(required)* – API key with **Mail Send** access.
 - ``SENDGRID_OUTBOUND_DOMAIN`` *(required)* – domain used to build the
-  ``From`` and dynamic Reply-To addresses for sends made through SendGrid.
+  ``From`` address for sends made through SendGrid.
 - ``SENDGRID_COMPANY_NAME`` – display name in the ``From`` header (defaults
   to ``"Your Company"``).
 
@@ -39,8 +40,8 @@ from sendgrid.helpers.mail import (
     FileName,
     FileType,
     From,
+    Header,
     Mail,
-    ReplyTo,
     To,
 )
 
@@ -63,8 +64,8 @@ class SendGridEmailProvider(EmailMaster):
         >>> result = provider.send_email(            # doctest: +SKIP
         ...     from_email="noreply@yourdomain.com", from_name="Acme",
         ...     to_email="buyer@x.com", to_name="Buyer",
-        ...     subject="Hi", html_body="<p>Hi</p>",
-        ...     reply_to="usr42_conv3fa9c1b2@mail.yourdomain.com")
+        ...     subject="[RFQ - hd273hsd] - Hi", html_body="<p>Hi</p>",
+        ...     message_id="<rfq.hd273hsd.ab@mail.yourdomain.com>")
         >>> result["status_code"]                    # doctest: +SKIP
         202
     """
@@ -113,14 +114,16 @@ class SendGridEmailProvider(EmailMaster):
         to_name: str,
         subject: str,
         html_body: str,
-        reply_to: str,
+        message_id: str,
+        extra_headers: dict[str, str] | None = None,
         attachments: list | None = None,
     ) -> dict:
         """Send one email via SendGrid and normalise the result.
 
         Builds a :class:`sendgrid.helpers.mail.Mail` message with the given
-        headers, sets ``Reply-To`` to the dynamic conversation address and
-        submits it. SendGrid returns HTTP ``202`` when the message is queued.
+        headers and submits it. SendGrid returns HTTP ``202`` when the
+        message is queued. No ``Reply-To`` is set — replies thread on
+        ``Message-ID``/``References`` and the ``[RFQ - id]`` subject prefix.
 
         Args:
             from_email (str): Sender address for the ``From`` header —
@@ -130,12 +133,16 @@ class SendGridEmailProvider(EmailMaster):
             to_name (str): Recipient display name.
             subject (str): Subject line.
             html_body (str): HTML body.
-            reply_to (str): Dynamic conversation address used as
-                ``Reply-To``.
+            message_id (str): The RFC ``Message-ID`` this app minted, added
+                as a custom header (``Message-ID`` is not on SendGrid's
+                reserved-header list).
+            extra_headers (dict[str, str] | None): Extra headers to add,
+                e.g. ``X-RFQ-Conversation-Id``.
+            attachments (list | None): Optional attachments.
 
         Returns:
             dict: ``{"status_code": int, "provider": "sendgrid",
-                "provider_message_id": str | None}``.
+                "provider_message_id": str | None, "message_id": str}``.
 
         Raises:
             EmailSendError: If the SendGrid SDK raises or the network call
@@ -145,9 +152,9 @@ class SendGridEmailProvider(EmailMaster):
             >>> provider.send_email(                  # doctest: +SKIP
             ...     from_email="noreply@yourdomain.com",
             ...     from_name="Acme", to_email="buyer@x.com",
-            ...     to_name="Buyer", subject="Hi",
+            ...     to_name="Buyer", subject="[RFQ - hd273hsd] - Hi",
             ...     html_body="<p>Hi</p>",
-            ...     reply_to="usr42_conv3fa9c1b2@mail.yourdomain.com")
+            ...     message_id="<rfq.hd273hsd.ab@mail.yourdomain.com>")
             {'status_code': 202, 'provider': 'sendgrid', ...}
         """
         try:
@@ -157,9 +164,12 @@ class SendGridEmailProvider(EmailMaster):
                 subject=subject,
                 html_content=html_body,
             )
-            # Reply-To carries the dynamic address so supplier replies flow
-            # back through SendGrid Inbound Parse to the webhook.
-            message.reply_to = ReplyTo(reply_to)
+            # Our own Message-ID goes on the wire so the inbound
+            # In-Reply-To/References lookup can hit our own DB. Some SendGrid
+            # plans rewrite it at the edge; the subject token is the fallback.
+            message.add_header(Header("Message-ID", message_id))
+            for key, value in (extra_headers or {}).items():
+                message.add_header(Header(key, value))
 
             for att in (attachments or []):
                 sg_att = Attachment(
@@ -176,12 +186,13 @@ class SendGridEmailProvider(EmailMaster):
 
             response = self._client.send(message)
 
-            # SendGrid exposes the provider message id in the response
-            # headers under ``X-Message-Id`` when available.
+            # SendGrid exposes its own message id in the response headers
+            # under ``X-Message-Id`` — distinct from the RFC Message-ID we
+            # minted and sent above.
             headers = getattr(response, "headers", {}) or {}
-            message_id = None
+            provider_message_id = None
             if hasattr(headers, "get"):
-                message_id = headers.get("X-Message-Id")
+                provider_message_id = headers.get("X-Message-Id")
 
             self.log.info(
                 "SendGrid accepted email to %s (status=%s)",
@@ -191,7 +202,8 @@ class SendGridEmailProvider(EmailMaster):
             return {
                 "status_code": response.status_code,
                 "provider": self.provider_name,
-                "provider_message_id": message_id,
+                "provider_message_id": provider_message_id,
+                "message_id": message_id,
             }
         except Exception as exc:  # noqa: BLE001 - normalise to one type
             self.log.error("SendGrid send failed: %s", exc)

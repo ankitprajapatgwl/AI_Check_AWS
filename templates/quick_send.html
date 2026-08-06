@@ -19,6 +19,7 @@
   .qs-status { min-height: 18px; }
   .qs-status-ok  { color: var(--success-txt); }
   .qs-status-err { color: var(--danger-txt); }
+  .qs-provider-hint { font-size: 11px; color: var(--txt2); }
 </style>
 
 {% for provider in available_providers %}
@@ -30,25 +31,24 @@
   <div class="compose-card-body">
     <div class="form-grid">
 
-      <div class="form-group qs-section">
-        <label>Chinese <span class="qs-type-badge chinese">CN</span></label>
-        <input type="email" class="qs-email" placeholder="destination@example.com">
-        <button type="button" class="btn btn-primary mt-8"
-                onclick="quickSend('{{ provider.key }}', 'chinese', this)">
-          <span>📤</span> Send with {{ provider.label }} to CN
-        </button>
-        <div class="qs-status text-sm"></div>
-      </div>
-
-      <div class="form-group qs-section">
-        <label>Non-Chinese <span class="qs-type-badge non_chinese">Non-CN</span></label>
-        <input type="email" class="qs-email" placeholder="destination@example.com">
-        <button type="button" class="btn btn-primary mt-8"
-                onclick="quickSend('{{ provider.key }}', 'non_chinese', this)">
-          <span>📤</span> Send with {{ provider.label }} to Non-CN
-        </button>
-        <div class="qs-status text-sm"></div>
-      </div>
+      {% for stype, stype_label, badge in [
+           ("chinese", "Chinese", "CN"),
+           ("non_chinese", "Non-Chinese", "Non-CN")] %}
+        {% if stype in provider.supported_types %}
+        <div class="form-group qs-section">
+          <label>{{ stype_label }} <span class="qs-type-badge {{ stype }}">{{ badge }}</span></label>
+          {# Names the region this card actually resolves to (see
+             src.route._SEND_KEYS), so a tester knows what they're exercising. #}
+          <span class="qs-provider-hint">→ {{ provider.region_hints[stype] }}</span>
+          <input type="email" class="qs-email" placeholder="destination@example.com">
+          <button type="button" class="btn btn-primary mt-8"
+                  onclick="quickSend('{{ provider.key }}', '{{ stype }}', this)">
+            <span>📤</span> Send with {{ provider.label }} to {{ badge }}
+          </button>
+          <div class="qs-status text-sm"></div>
+        </div>
+        {% endif %}
+      {% endfor %}
 
     </div>
   </div>
@@ -58,9 +58,11 @@
 <div style="margin-top: 24px; padding: 16px 20px; background: var(--card); border: 1px solid var(--border); border-radius: var(--r);">
   <div style="font-size: 13px; font-weight: 600; margin-bottom: 8px; color: var(--txt2);">How it works</div>
   <ol style="padding-left: 18px; font-size: 13px; color: var(--txt2); line-height: 1.8;">
-    <li>Enter only the destination email in the section for the provider and supplier type you want to test.</li>
+    <li>Enter only the destination email in the section for the provider and supplier type you want to test. Each section shows the region it resolves to.</li>
     <li>Supplier name, product, quantity and target price are all filled in with fixed test defaults automatically.</li>
-    <li>Clicking "Send Test RFQ" calls the same <code style="background:var(--bg);padding:1px 5px;border-radius:3px;">POST /send</code> endpoint as the full Send RFQ form.</li>
+    <li>Clicking Send calls the same <code style="background:var(--bg);padding:1px 5px;border-radius:3px;">POST /send</code> endpoint as the full Send RFQ form — so the conversation is created as a draft first, then flipped to Open once the provider accepts it.</li>
+    <li>The email's subject is <code style="background:var(--bg);padding:1px 5px;border-radius:3px;">[RFQ - id] - …</code> and it carries its own <code style="background:var(--bg);padding:1px 5px;border-radius:3px;">Message-ID</code>. There is no per-conversation reply address: a reply is matched by <code style="background:var(--bg);padding:1px 5px;border-radius:3px;">Message-ID</code>/<code style="background:var(--bg);padding:1px 5px;border-radius:3px;">References</code>, falling back to that subject prefix.</li>
+    <li>Chinese sections send the Simplified-Chinese body template; Non-Chinese sections send the English one.</li>
     <li>On a successful send, the conversation's tracking page opens automatically in a new tab.</li>
   </ol>
 </div>
@@ -112,8 +114,13 @@
       .then(function (res) {
         if (res.url && res.url.indexOf("/tracking/") !== -1 && res.url.indexOf("error=") === -1) {
           window.open(res.url, "_blank", "noopener");
+          // POST /send redirects to /tracking/{conv_id}, so the conversation
+          // id — which is also the subject's [RFQ - id] token — is right
+          // there in the final URL.
+          var convId = res.url.split("/tracking/")[1].split("?")[0];
           statusEl.className = "qs-status text-sm qs-status-ok";
-          statusEl.textContent = "✅ Sent — opened the tracking page in a new tab.";
+          statusEl.textContent = "✅ Sent — [RFQ - " + convId +
+            "] — opened tracking in a new tab.";
         } else {
           var message = "Send failed.";
           try {

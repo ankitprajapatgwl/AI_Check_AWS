@@ -3,16 +3,17 @@
 :class:`ElasticEmailProvider` implements :meth:`EmailMaster.send_email`
 using the official :mod:`ElasticEmail` Python SDK (the
 ``Emails.Transactional`` endpoint). The ``From`` header uses the verified
-sender and the ``Reply-To`` header carries the dynamic conversation address
-so replies route back through Elastic Email's inbound route to this app's
-webhook.
+sender, and the RFC ``Message-ID`` this app mints is passed through
+``EmailContent(headers=…)``. No ``Reply-To`` is set — replies come back to
+the ``From`` address (routed to this app's webhook by Elastic Email's inbound
+route) and are threaded by ``Message-ID``/``References`` plus the
+``[RFQ - id]`` subject prefix.
 
 Configuration consumed (see :class:`src.config.Settings`):
 
 - ``ELASTICEMAIL_API_KEY`` *(required)* – API key with **Send** access.
 - ``ELASTICEMAIL_OUTBOUND_DOMAIN`` *(required)* – domain used to build the
-  ``From`` and dynamic Reply-To addresses for sends made through Elastic
-  Email.
+  ``From`` address for sends made through Elastic Email.
 - ``ELASTICEMAIL_COMPANY_NAME`` – display name in the ``From`` header
   (defaults to ``"Your Company"``).
 
@@ -63,8 +64,8 @@ class ElasticEmailProvider(EmailMaster):
         >>> result = provider.send_email(            # doctest: +SKIP
         ...     from_email="noreply@yourdomain.com", from_name="Acme",
         ...     to_email="buyer@x.com", to_name="Buyer",
-        ...     subject="Hi", html_body="<p>Hi</p>",
-        ...     reply_to="usr42_conv3fa9c1b2@mail.yourdomain.com")
+        ...     subject="[RFQ - hd273hsd] - Hi", html_body="<p>Hi</p>",
+        ...     message_id="<rfq.hd273hsd.ab@mail.yourdomain.com>")
         >>> result["provider"]                       # doctest: +SKIP
         'elasticemail'
     """
@@ -112,15 +113,17 @@ class ElasticEmailProvider(EmailMaster):
         to_name: str,
         subject: str,
         html_body: str,
-        reply_to: str,
+        message_id: str,
+        extra_headers: dict[str, str] | None = None,
         attachments: list | None = None,
     ) -> dict:
         """Send one email via Elastic Email's transactional endpoint.
 
         Builds an :class:`EmailTransactionalMessageData` payload with a
-        single HTML body part, the dynamic ``Reply-To`` and the verified
-        ``From`` header, then submits it through the SDK. The response
-        carries the Elastic Email transaction / message id.
+        single HTML body part and the verified ``From`` header, then submits
+        it through the SDK. The response carries the Elastic Email
+        transaction / message id. No ``Reply-To`` is set — replies thread on
+        ``Message-ID``/``References`` and the ``[RFQ - id]`` subject prefix.
 
         Args:
             from_email (str): Verified sender address.
@@ -130,14 +133,18 @@ class ElasticEmailProvider(EmailMaster):
                 accepted for interface parity).
             subject (str): Subject line.
             html_body (str): HTML body.
-            reply_to (str): Dynamic conversation address used as
-                ``Reply-To``.
+            message_id (str): The RFC ``Message-ID`` this app minted, sent
+                through ``EmailContent(headers=…)``.
+            extra_headers (dict[str, str] | None): Extra headers merged into
+                the same dict, e.g. ``X-RFQ-Conversation-Id``.
+            attachments (list | None): Accepted for interface parity; the
+                transactional payload built here carries no attachment part.
 
         Returns:
             dict: ``{"status_code": int, "provider": "elasticemail",
-                "provider_message_id": str | None}``. ``status_code`` is
-                ``202`` on success to mirror the other providers' "queued"
-                semantics.
+                "provider_message_id": str | None, "message_id": str}``.
+                ``status_code`` is ``202`` on success to mirror the other
+                providers' "queued" semantics.
 
         Raises:
             EmailSendError: If the SDK raises or the API rejects the send.
@@ -146,9 +153,9 @@ class ElasticEmailProvider(EmailMaster):
             >>> provider.send_email(                  # doctest: +SKIP
             ...     from_email="noreply@yourdomain.com",
             ...     from_name="Acme", to_email="buyer@x.com",
-            ...     to_name="Buyer", subject="Hi",
+            ...     to_name="Buyer", subject="[RFQ - hd273hsd] - Hi",
             ...     html_body="<p>Hi</p>",
-            ...     reply_to="usr42_conv3fa9c1b2@mail.yourdomain.com")
+            ...     message_id="<rfq.hd273hsd.ab@mail.yourdomain.com>")
             {'status_code': 202, 'provider': 'elasticemail', ...}
         """
         # Elastic Email expects the sender as a single "Name <addr>" string.
@@ -162,7 +169,7 @@ class ElasticEmailProvider(EmailMaster):
                 )
             ],
             var_from=from_header,
-            reply_to=reply_to,
+            headers={"Message-ID": message_id, **(extra_headers or {})},
             subject=subject,
         )
         message = EmailTransactionalMessageData(
@@ -181,18 +188,22 @@ class ElasticEmailProvider(EmailMaster):
             ) from exc
 
         # The SDK returns an ``EmailSend`` object exposing a transaction id
-        # and/or message id; surface whichever is present.
-        message_id = (
+        # and/or message id; surface whichever is present. This is Elastic
+        # Email's own id, distinct from the RFC Message-ID we minted above.
+        provider_message_id = (
             getattr(result, "message_id", None)
             or getattr(result, "transaction_id", None)
         )
         self.log.info(
             "Elastic Email accepted email to %s (txn=%s)",
             to_email,
-            message_id,
+            provider_message_id,
         )
         return {
             "status_code": 202,
             "provider": self.provider_name,
-            "provider_message_id": str(message_id) if message_id else None,
+            "provider_message_id": (
+                str(provider_message_id) if provider_message_id else None
+            ),
+            "message_id": message_id,
         }

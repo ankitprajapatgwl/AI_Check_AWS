@@ -13,8 +13,8 @@ Field                Meaning
 ``from_email``       Sender address
 ``from_name``        Sender display name
 ``env_from``         SMTP envelope sender
-``env_to_list``      Envelope recipients (the dynamic address may be here)
-``to_list``          ``To`` header recipients (parsed for the dynamic addr)
+``env_to_list``      Envelope recipients
+``to_list``          ``To`` header recipients
 ``subject``          Subject line
 ``body_text``        Plain-text body
 ``body_html``        HTML body
@@ -34,6 +34,8 @@ Example:
 """
 
 import base64
+import email
+from email.policy import default
 
 from fastapi import Request
 
@@ -96,8 +98,8 @@ class ElasticEmailWebhookParser(WebhookParserMaster):
                 f"Could not read Elastic Email form body: {exc}"
             ) from exc
 
-        # The dynamic address can land in either recipient list, so join
-        # both: ``parse_dynamic_email`` searches the combined string.
+        # Either recipient list may hold the address the supplier actually
+        # replied to, so both are joined and recorded.
         to_combined = " ".join(
             value
             for value in (
@@ -107,6 +109,15 @@ class ElasticEmailWebhookParser(WebhookParserMaster):
             if value
         )
 
+        # ``header_list`` is a raw "Name: Value" block; parsing it as a
+        # headers-only MIME message recovers the threading headers.
+        raw_headers = form.get("header_list", "") or ""
+        headers = self.headers_from_mime(
+            email.message_from_string(raw_headers, policy=default)
+            if raw_headers
+            else None
+        )
+
         inbound = InboundEmail(
             from_email=form.get("from_email", ""),
             to_email=to_combined,
@@ -114,14 +125,21 @@ class ElasticEmailWebhookParser(WebhookParserMaster):
             body_text=form.get("body_text", ""),
             body_html=form.get("body_html", ""),
             provider=self.provider_name,
+            message_id=headers.get("message-id", ""),
+            in_reply_to=headers.get("in-reply-to", ""),
+            references=headers.get("references", ""),
+            headers=headers,
+            raw_message=raw_headers,
         )
 
         inbound.attachments = self._extract_attachments(form)
         self.log.info(
-            "Parsed Elastic Email inbound: %s -> %s (%d attachment(s))",
+            "Parsed Elastic Email inbound: %s -> %s (%d attachment(s), "
+            "message_id=%s)",
             inbound.from_email,
             to_combined,
             len(inbound.attachments),
+            inbound.message_id or "-",
         )
         return inbound
 

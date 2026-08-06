@@ -191,8 +191,8 @@ class Settings:
         ).rstrip("/")
         # Separate outbound domain for the Hong Kong/CN region — independent
         # of ``SENDCLOUD_OUTBOUND_DOMAIN`` (the Singapore region's domain)
-        # since Chinese suppliers are sent a From/Reply-To address on
-        # whatever domain is verified against the Hong Kong region.
+        # since Chinese suppliers are sent a From address on whatever domain
+        # is verified against the Hong Kong region.
         self.sendcloud_hk_outbound_domain = os.getenv(
             "SENDCLOUD_HK_OUTBOUND_DOMAIN", ""
         )
@@ -205,6 +205,105 @@ class Settings:
         self.engagelab_api_base = os.getenv(
             "ENGAGELAB_API_BASE", "https://email.api.engagelab.cc"
         ).rstrip("/")
+
+        # ── Threading: host part of the Message-IDs this app mints ───
+        # Every outbound RFQ carries an app-minted RFC Message-ID
+        # (``<rfq.{conv_id}.{uuid}@{this domain}>``) so a reply's
+        # In-Reply-To/References can be looked up in our own database. The
+        # leading '@' is stripped so both ``imsflow.online`` and
+        # ``@imsflow.online`` work. Falls back per provider to that
+        # provider's own outbound domain when unset.
+        self.message_id_domain = (
+            os.getenv("MESSAGE_ID_DOMAIN", "") or ""
+        ).strip().lstrip("@")
+
+        # ── Alibaba Enterprise Mail — Singapore (non-Chinese suppliers) ──
+        # Alibaba is SMTP-out / IMAP-in rather than an HTTP API, so it needs
+        # a mailbox + password instead of an API key pair. The password is
+        # the *third-party client security password* generated in the
+        # Alibaba admin console — NOT the web login password (see
+        # setup_docs/alibaba_guide/Alibaba_Documentation.md).
+        #
+        # ALIBABA_OUTBOUND_DOMAIN / ALIBABA_COMPANY_NAME are read generically
+        # by provider_outbound_domain() / provider_company_name() below, but
+        # the domain is also exposed as an attribute here because the
+        # provider resolves it directly (it skips the generic base-class
+        # constructor to stay symmetrical with its HK subclass).
+        self.alibaba_outbound_domain = self.provider_outbound_domain("alibaba")
+        # The bare MAIL_* names are the pre-existing keys from the standalone
+        # Alibaba scratch script; kept as fallbacks so an existing .env keeps
+        # working after this rework.
+        self.alibaba_mail_address = os.getenv(
+            "ALIBABA_MAIL_ADDRESS"
+        ) or os.getenv("MAIL_ADDRESS")
+        self.alibaba_mail_password = os.getenv(
+            "ALIBABA_MAIL_PASSWORD"
+        ) or os.getenv("MAIL_PASSWORD")
+        self.alibaba_smtp_host = os.getenv(
+            "ALIBABA_SMTP_HOST", "smtp.qiye.aliyun.com"
+        )
+        self.alibaba_smtp_port = int(os.getenv("ALIBABA_SMTP_PORT", "465"))
+        self.alibaba_imap_host = os.getenv(
+            "ALIBABA_IMAP_HOST", "imap.qiye.aliyun.com"
+        )
+        self.alibaba_imap_port = int(os.getenv("ALIBABA_IMAP_PORT", "993"))
+        self.alibaba_imap_mailbox = os.getenv("ALIBABA_IMAP_MAILBOX", "INBOX")
+        # Optional archive folder; when set, handled messages are moved there
+        # instead of merely being flagged \Seen.
+        self.alibaba_imap_processed_mailbox = os.getenv(
+            "ALIBABA_IMAP_PROCESSED_MAILBOX", ""
+        )
+
+        # ── Alibaba Enterprise Mail — Hong Kong (Chinese suppliers) ──────
+        # Every value falls back to its Singapore counterpart, so a single
+        # mailbox can serve both regions and only the hosts differ. The
+        # outbound domain is the exception worth setting explicitly if the
+        # two regions send from different verified domains.
+        self.alibaba_hk_outbound_domain = (
+            os.getenv("ALIBABA_HK_OUTBOUND_DOMAIN", "")
+            or self.alibaba_outbound_domain
+        )
+        self.alibaba_hk_mail_address = (
+            os.getenv("ALIBABA_HK_MAIL_ADDRESS") or self.alibaba_mail_address
+        )
+        self.alibaba_hk_mail_password = (
+            os.getenv("ALIBABA_HK_MAIL_PASSWORD") or self.alibaba_mail_password
+        )
+        self.alibaba_hk_smtp_host = os.getenv(
+            "ALIBABA_HK_SMTP_HOST", "smtphk.qiye.aliyun.com"
+        )
+        self.alibaba_hk_smtp_port = int(
+            os.getenv("ALIBABA_HK_SMTP_PORT", str(self.alibaba_smtp_port))
+        )
+        self.alibaba_hk_imap_host = os.getenv(
+            "ALIBABA_HK_IMAP_HOST", "imaphk.qiye.aliyun.com"
+        )
+        self.alibaba_hk_imap_port = int(
+            os.getenv("ALIBABA_HK_IMAP_PORT", str(self.alibaba_imap_port))
+        )
+        self.alibaba_hk_imap_mailbox = (
+            os.getenv("ALIBABA_HK_IMAP_MAILBOX")
+            or self.alibaba_imap_mailbox
+        )
+        self.alibaba_hk_imap_processed_mailbox = (
+            os.getenv("ALIBABA_HK_IMAP_PROCESSED_MAILBOX")
+            or self.alibaba_imap_processed_mailbox
+        )
+
+        # ── Alibaba inbound polling ─────────────────────────────────────
+        # Alibaba has no inbound webhook, so replies are polled (see
+        # src/inbound/alibaba_imap_poller.py). Set this to false on every
+        # replica but one — each replica otherwise polls the same mailbox.
+        self.alibaba_inbound_enabled = (
+            os.getenv("ALIBABA_INBOUND_ENABLED", "true").strip().lower()
+            == "true"
+        )
+        self.alibaba_poll_interval_seconds = int(
+            os.getenv(
+                "ALIBABA_POLL_INTERVAL_SECONDS",
+                os.getenv("POLL_INTERVAL_SECONDS", "30"),
+            )
+        )
 
         # ── Bedrock Availability POC (linked from the "/" landing page) ──
         # Full override for the "Check Bedrock" button's target URL. Leave
@@ -234,16 +333,17 @@ class Settings:
     def provider_outbound_domain(self, provider_name: str) -> str:
         """Return the sending domain configured for ``provider_name``.
 
-        Used to build both the per-conversation dynamic Reply-To address
-        and the From address (see
-        :meth:`~src.email_platform.email_master.EmailMaster.build_dynamic_email`
-        / :meth:`~src.email_platform.email_master.EmailMaster.build_sending_email`).
-        Different providers can use different domains, e.g.
-        ``ENGAGELAB_OUTBOUND_DOMAIN`` vs ``SENDCLOUD_OUTBOUND_DOMAIN`` — keep
-        them equal across providers unless the inbound webhook parser is
-        also taught to check every configured domain, since only one
-        provider's parser handles ``POST /webhooks/inbound`` (see
-        :func:`src.app.create_app`).
+        Used to build the ``From`` address (see
+        :meth:`~src.email_platform.email_master.EmailMaster.build_sending_email`)
+        and, when ``MESSAGE_ID_DOMAIN`` is unset, the host part of the
+        Message-IDs sent through that provider.
+
+        Every provider has its own domain — ``ENGAGELAB_OUTBOUND_DOMAIN``,
+        ``SENDCLOUD_OUTBOUND_DOMAIN``, ``ALIBABA_OUTBOUND_DOMAIN``, … — and
+        since this rework they are genuinely independent: inbound is
+        per-provider (``POST /webhooks/inbound/{provider}`` plus Alibaba's
+        IMAP poller) and matching no longer parses the recipient address at
+        all, so there is no reason to keep them equal.
 
         Args:
             provider_name (str): Provider key, e.g. ``"engagelab"``.
@@ -279,13 +379,16 @@ class Settings:
         """Best-effort domain for contexts with no provider chosen yet.
 
         Registration (the permanent ``sending_email`` preview/assignment in
-        :mod:`src.auth.routes`), the dev-bypass "John Carter" shortcut
-        (:mod:`src.auth.dev_bypass`) and generated Message-ID hosts
-        (:meth:`~src.db.repository.Repository._generate_message_id`) all
-        need *some* domain before any provider has been picked on the Send
-        RFQ form. Prefers EngageLab's (the provider with real inbound reply
-        parsing), falling back to SendCloud's — extend this if another
-        provider becomes the preferred default.
+        :mod:`src.auth.routes`) and the dev-bypass "John Carter" shortcut
+        (:mod:`src.auth.dev_bypass`) both need *some* domain before any
+        provider has been picked on the Send RFQ form. Prefers EngageLab's,
+        falling back to SendCloud's — extend this if another provider becomes
+        the preferred default.
+
+        Not used for Message-ID hosts: those come from
+        :attr:`message_id_domain`, falling back to the *sending* provider's
+        own outbound domain (see
+        :meth:`~src.email_platform.email_master.EmailMaster.build_message_id`).
 
         Returns:
             str: The first configured candidate domain, or ``""`` if none

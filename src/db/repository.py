@@ -27,6 +27,7 @@ from src.db.models import (
     Conversation,
     Email,
     Product,
+    UnmatchedAttachment,
     UnmatchedEmail,
     User,
     UserSession,
@@ -150,11 +151,10 @@ class Repository:
     async def get_user_by_sending_email(self, sending_email: str) -> dict | None:
         """Reverse-lookup the user who owns a permanent ``sending_email``.
 
-        Used to bind a supplier's brand-new (headerless) email to its owning
-        user when it carries no conv_id anywhere — see
-        :meth:`~src.services.conversation_service.ConversationService._match_new_thread`.
         ``sending_email`` is ``UNIQUE`` (``uq_users_sending_email``), so at
-        most one user can match.
+        most one user can match. No longer part of inbound matching — that is
+        now headers-then-subject-token only (requirement 5) — but kept as the
+        one available "who owns this address?" lookup.
 
         Args:
             sending_email (str): The bare address to look up (case-insensitive).
@@ -315,28 +315,50 @@ class Repository:
             return result.scalar_one_or_none() is not None
 
     async def get_user_stats(self, user_id: str) -> dict:
+        """Count this user's conversations per lifecycle status.
+
+        Returns:
+            dict: ``total`` plus one count per status —  ``draft`` (created
+                but not sent), ``open`` (sent, awaiting a reply), ``closed``
+                (a reply bound to it) and ``failed`` (the provider rejected
+                the send).
+        """
         async with self._session() as session:
             row = (
                 await session.execute(
                     select(
                         func.count(Conversation.id),
+                        func.sum(case((Conversation.status == "draft", 1), else_=0)),
                         func.sum(case((Conversation.status == "open", 1), else_=0)),
-                        func.sum(case((Conversation.status == "replied", 1), else_=0)),
-                        func.sum(case((Conversation.status == "declined", 1), else_=0)),
+                        func.sum(case((Conversation.status == "closed", 1), else_=0)),
+                        func.sum(case((Conversation.status == "failed", 1), else_=0)),
                     ).where(Conversation.user_id == self._as_uuid(user_id))
                 )
             ).one()
         return {
             "total": row[0] or 0,
-            "open": int(row[1] or 0),
-            "replied": int(row[2] or 0),
-            "declined": int(row[3] or 0),
+            "draft": int(row[1] or 0),
+            "open": int(row[2] or 0),
+            "closed": int(row[3] or 0),
+            "failed": int(row[4] or 0),
         }
 
     # ── Conversations: write ────────────────────────────────────────────
 
     async def insert_conversation(self, conversation: dict) -> None:
-        """Persist a new conversation.
+        """Persist a new conversation, normally as a ``status='draft'`` row.
+
+        Requirement 1: the row exists before any email is sent, so a send
+        failure still leaves a durable record of what was attempted.
+
+        Args:
+            conversation (dict): The conversation to store. ``conv_id``,
+                ``user_id``, ``supplier_name`` and ``supplier_email`` are
+                required; ``provider``, ``send_key``, ``from_address`` and
+                ``supplier_type`` are all optional at draft time.
+
+        Returns:
+            None
 
         Raises:
             DuplicateConversationTokenError: If ``conversation["conv_id"]``
@@ -353,11 +375,13 @@ class Repository:
                 target_price=conversation.get("target_price"),
                 supplier_name=conversation["supplier_name"],
                 supplier_email=conversation["supplier_email"],
+                supplier_type=conversation.get("supplier_type") or None,
                 subject=conversation.get("subject") or "",
                 token=conversation["conv_id"],
-                reply_to_address=conversation["email_address"],
-                provider=conversation["provider"],
-                status=conversation.get("status", "open"),
+                from_address=conversation.get("from_address") or None,
+                provider=conversation.get("provider") or None,
+                send_key=conversation.get("send_key") or None,
+                status=conversation.get("status", "draft"),
                 reply_count=conversation.get("reply_count", 0),
             )
             session.add(row)
@@ -371,12 +395,31 @@ class Repository:
                     ) from exc
                 raise
         self.log.debug(
-            "Inserted conversation %s for user %s",
+            "Inserted conversation %s for user %s (status=%s)",
             conversation["conv_id"],
             conversation["user_id"],
+            conversation.get("status", "draft"),
         )
 
     async def add_sent_email(self, conv_id: str, email_data: dict) -> None:
+        """Record the RFQ this app just put on the wire.
+
+        ``email_data["message_id"]`` is used verbatim — it is the real RFC
+        header value that was sent, which is what makes the inbound
+        ``In-Reply-To``/``References`` lookup resolvable. A duplicate is
+        logged and skipped rather than raised, since a retried send is not
+        worth failing the request over.
+
+        Args:
+            conv_id (str): The conversation this email belongs to.
+            email_data (dict): Must carry ``message_id``; optionally
+                ``provider_message_id``, ``status_code``, ``from_email``,
+                ``to_email``, ``subject``, ``body_html``, ``email_type``,
+                ``provider`` and ``attachments``.
+
+        Returns:
+            None
+        """
         async with self._session() as session:
             conv = await self._get_conversation_row(session, conv_id)
             if conv is None:
@@ -391,17 +434,51 @@ class Repository:
                 subject=email_data.get("subject", ""),
                 body_html=email_data.get("body_html"),
                 body_text=email_data.get("body_text"),
-                message_id=self._generate_message_id(),
+                message_id=email_data["message_id"],
+                in_reply_to=email_data.get("in_reply_to") or None,
+                references_header=email_data.get("references_header") or None,
                 reply_type=email_data.get("email_type"),
-                provider=email_data.get("provider") or conv.provider,
+                matched_via=None,
+                provider=email_data.get("provider") or conv.provider or "",
+                provider_message_id=email_data.get("provider_message_id"),
+                status_code=email_data.get("status_code"),
             )
             session.add(row)
-            await session.flush()
+            try:
+                await session.flush()
+            except IntegrityError as exc:
+                await session.rollback()
+                if self._is_unique_violation(exc, "uq_emails_message_id"):
+                    self.log.warning(
+                        "add_sent_email: message_id %s already recorded on "
+                        "%s, skipping",
+                        email_data["message_id"],
+                        conv_id,
+                    )
+                    return
+                raise
             self._add_attachments(session, row.id, email_data.get("attachments"))
             await session.commit()
         self.log.debug("Recorded sent email on %s", conv_id)
 
     async def add_received_email(self, conv_id: str, email_data: dict) -> None:
+        """Record an inbound reply against its conversation.
+
+        The status transition is **not** made here — the service owns it (see
+        :meth:`close_conversation`), so this method only touches the reply
+        bookkeeping. ``message_id`` is the sender's own header value, so a
+        redelivery of the same message is caught by the UNIQUE constraint and
+        skipped.
+
+        Args:
+            conv_id (str): The conversation this reply bound to.
+            email_data (dict): Must carry ``message_id``; optionally
+                ``in_reply_to``, ``references_header``, ``matched_via``,
+                bodies, ``dkim``/``spf``/``spam_score`` and ``attachments``.
+
+        Returns:
+            None
+        """
         async with self._session() as session:
             conv = await self._get_conversation_row(session, conv_id)
             if conv is None:
@@ -416,21 +493,129 @@ class Repository:
                 subject=email_data.get("subject", ""),
                 body_html=email_data.get("body_html"),
                 body_text=email_data.get("body_text"),
-                message_id=self._generate_message_id(),
+                message_id=email_data["message_id"],
+                in_reply_to=email_data.get("in_reply_to") or None,
+                references_header=email_data.get("references_header") or None,
                 reply_type=email_data.get("email_type"),
+                matched_via=email_data.get("matched_via"),
                 dkim=email_data.get("dkim"),
                 spf=email_data.get("spf"),
                 spam_score=self._as_float(email_data.get("spam_score")),
-                provider=email_data.get("provider") or conv.provider,
+                provider=email_data.get("provider") or conv.provider or "",
             )
             session.add(row)
-            await session.flush()
+            try:
+                await session.flush()
+            except IntegrityError as exc:
+                await session.rollback()
+                if self._is_unique_violation(exc, "uq_emails_message_id"):
+                    # Two concurrent deliveries of the same message can race
+                    # past the email_exists() guard; the constraint is the
+                    # backstop that keeps it a no-op instead of a 500.
+                    self.log.info(
+                        "add_received_email: duplicate message_id %s on %s, "
+                        "skipping",
+                        email_data["message_id"],
+                        conv_id,
+                    )
+                    return
+                raise
             self._add_attachments(session, row.id, email_data.get("attachments"))
             conv.reply_count = (conv.reply_count or 0) + 1
             conv.last_reply_at = datetime.now(timezone.utc)
-            conv.status = "replied"
             await session.commit()
         self.log.debug("Recorded inbound reply on %s", conv_id)
+
+    # ── Conversations: lifecycle transitions ────────────────────────────
+
+    async def mark_conversation_sent(
+        self,
+        conv_id: str,
+        *,
+        provider: str,
+        send_key: str,
+        from_address: str,
+        subject: str,
+    ) -> None:
+        """Flip a draft to ``open`` after a successful send (requirement 3).
+
+        Args:
+            conv_id (str): The conversation that was just sent.
+            provider (str): The provider that accepted the message.
+            send_key (str): The resolved factory key, e.g. ``"alibaba_hk"``.
+            from_address (str): The address the RFQ actually went out from.
+            subject (str): The subject actually sent.
+
+        Returns:
+            None
+        """
+        async with self._session() as session:
+            conv = await self._get_conversation_row(session, conv_id)
+            if conv is None:
+                self.log.warning(
+                    "mark_conversation_sent: unknown conv_id %s", conv_id
+                )
+                return
+            conv.status = "open"
+            conv.provider = provider or conv.provider
+            conv.send_key = send_key or conv.send_key
+            conv.from_address = from_address or conv.from_address
+            conv.subject = subject or conv.subject
+            conv.sent_at = datetime.now(timezone.utc)
+            await session.commit()
+        self.log.info("Conversation %s: draft -> open", conv_id)
+
+    async def close_conversation(
+        self, conv_id: str, *, last_action: str | None = None
+    ) -> None:
+        """Close a conversation once a reply has bound to it.
+
+        Requirement 4: any matched inbound reply closes the conversation,
+        whatever it says. The classifier's verdict is stored alongside in
+        ``last_action`` so nothing is lost, but it no longer decides anything.
+
+        Args:
+            conv_id (str): The conversation to close.
+            last_action (str | None): The reply classifier's verdict.
+
+        Returns:
+            None
+        """
+        async with self._session() as session:
+            conv = await self._get_conversation_row(session, conv_id)
+            if conv is None:
+                self.log.warning(
+                    "close_conversation: unknown conv_id %s", conv_id
+                )
+                return
+            conv.status = "closed"
+            conv.closed_at = datetime.now(timezone.utc)
+            if last_action:
+                conv.last_action = last_action
+            await session.commit()
+        self.log.info(
+            "Conversation %s: closed (last_action=%s)", conv_id, last_action
+        )
+
+    async def mark_conversation_failed(self, conv_id: str) -> None:
+        """Mark a draft as ``failed`` when the provider rejects the send.
+
+        Args:
+            conv_id (str): The conversation whose send failed.
+
+        Returns:
+            None
+        """
+        async with self._session() as session:
+            conv = await self._get_conversation_row(session, conv_id)
+            if conv is None:
+                self.log.warning(
+                    "mark_conversation_failed: unknown conv_id %s", conv_id
+                )
+                return
+            conv.status = "failed"
+            await session.commit()
+        self.log.warning("Conversation %s: draft -> failed", conv_id)
 
     async def update_conversation(self, conv_id: str, updates: dict) -> None:
         async with self._session() as session:
@@ -478,20 +663,86 @@ class Repository:
         )
         return tokens
 
-    async def insert_unmatched(self, email_data: dict) -> None:
+    async def insert_unmatched_email(self, email_data: dict) -> str:
+        """Persist an inbound email that matched no conversation, in full.
+
+        Requirement 4, step 4. Unlike the old stub-only record, everything
+        needed to review (or later re-bind) the message is stored: sender,
+        subject, both bodies and the threading headers.
+
+        Args:
+            email_data (dict): Normalised inbound fields — ``from_email``,
+                ``to_email``, ``subject``, ``body_text``, ``body_html``,
+                ``provider``, ``message_id``, ``in_reply_to``,
+                ``references_header``, ``received_at`` and ``reason``.
+
+        Returns:
+            str: The new ``unmatched_emails.id``, so attachments can be
+                attached to it.
+        """
         async with self._session() as session:
             row = UnmatchedEmail(
                 id=uuid.uuid4(),
-                raw_payload=email_data,
+                # The full normalised payload is kept as JSONB too, so a
+                # field this schema doesn't have a column for is not lost.
+                raw_payload=self._jsonable(email_data),
                 to_email=email_data.get("to_email"),
                 from_email=email_data.get("from_email"),
+                subject=email_data.get("subject"),
+                body_text=email_data.get("body_text"),
+                body_html=email_data.get("body_html"),
+                provider=email_data.get("provider"),
+                message_id=email_data.get("message_id") or None,
+                in_reply_to=email_data.get("in_reply_to") or None,
+                references_header=email_data.get("references_header") or None,
                 reason=email_data.get("reason", "unmatched"),
                 status="needs_review",
+                received_at=datetime.now(timezone.utc),
             )
             session.add(row)
             await session.commit()
+            unmatched_id = str(row.id)
         self.log.info(
-            "Stored unmatched inbound email to %s", email_data.get("to_email")
+            "Stored unmatched inbound email from %s to %s (id=%s)",
+            email_data.get("from_email"),
+            email_data.get("to_email"),
+            unmatched_id,
+        )
+        return unmatched_id
+
+    async def add_unmatched_attachments(
+        self, unmatched_email_id: str, attachments: list[dict]
+    ) -> None:
+        """Attach already-persisted files to an unmatched email record.
+
+        Args:
+            unmatched_email_id (str): The ``unmatched_emails.id`` returned by
+                :meth:`insert_unmatched_email`.
+            attachments (list[dict]): Metadata dicts as returned by
+                :meth:`~src.webhook_factory.webhook_master.WebhookParserMaster.persist_unmatched_attachments`.
+
+        Returns:
+            None
+        """
+        if not attachments:
+            return
+        async with self._session() as session:
+            for att in attachments:
+                session.add(
+                    UnmatchedAttachment(
+                        id=uuid.uuid4(),
+                        unmatched_email_id=self._as_uuid(unmatched_email_id),
+                        filename=att.get("filename", "attachment"),
+                        url=att.get("url", ""),
+                        content_type=att.get("content_type"),
+                        size_bytes=att.get("size"),
+                    )
+                )
+            await session.commit()
+        self.log.debug(
+            "Stored %d attachment(s) on unmatched email %s",
+            len(attachments),
+            unmatched_email_id,
         )
 
     # ── Conversations: read ─────────────────────────────────────────────
@@ -515,39 +766,67 @@ class Repository:
                 for c in result.scalars()
             ]
 
-    async def find_latest_conversation_by_supplier(
-        self, user_id: str, supplier_email: str
+    async def find_conversation_by_message_ids(
+        self, message_ids: list[str]
     ) -> dict | None:
-        """Find the most recent conversation between a user and a supplier.
+        """Resolve a conversation from RFC ``Message-ID`` values.
 
-        Used to bind a supplier's brand-new (headerless) email to whichever
-        thread they already have going with this user, instead of opening a
-        duplicate conversation every time that supplier composes fresh
-        instead of hitting reply — see
-        :meth:`~src.services.conversation_service.ConversationService._match_new_thread`.
+        The primary inbound matching strategy (requirement 4, step 1): a
+        reply's ``In-Reply-To``/``References`` name the ids of the messages
+        it answers, and this app minted (and stored) the id of every RFQ it
+        sent, so one join resolves the thread.
+
+        Caller order is preserved deliberately — the service passes the
+        most-recent reference first, so on a long thread the newest matching
+        conversation wins rather than an arbitrary one.
 
         Args:
-            user_id (str): The conversation owner.
-            supplier_email (str): The supplier's address (case-insensitive).
+            message_ids (list[str]): Angle-bracketed ids, most recent first.
 
         Returns:
-            dict | None: The most recently created matching conversation, or
-                ``None`` if this supplier has no conversation with the user yet.
+            dict | None: The matching conversation, or ``None`` if none of
+                the ids are ours.
         """
+        if not message_ids:
+            return None
         async with self._session() as session:
-            conv = (
+            rows = (
                 await session.execute(
-                    select(Conversation)
-                    .where(
-                        Conversation.user_id == self._as_uuid(user_id),
-                        func.lower(Conversation.supplier_email)
-                        == supplier_email.lower(),
-                    )
-                    .order_by(Conversation.created_at.desc())
-                    .limit(1)
+                    select(Email.message_id, Conversation)
+                    .join(Conversation, Email.conversation_id == Conversation.id)
+                    .where(Email.message_id.in_(message_ids))
                 )
-            ).scalar_one_or_none()
-            return self._conversation_to_dict(conv, include_emails=False) if conv else None
+            ).all()
+            if not rows:
+                return None
+            by_message_id = {row[0]: row[1] for row in rows}
+            for message_id in message_ids:
+                conv = by_message_id.get(message_id)
+                if conv is not None:
+                    return self._conversation_to_dict(conv, include_emails=False)
+            return None
+
+    async def email_exists(self, message_id: str) -> bool:
+        """Return whether an email with this ``Message-ID`` is already stored.
+
+        The inbound idempotency guard: IMAP polling re-delivers anything not
+        yet flagged, and webhook providers retry on any non-2xx, so the same
+        message reaching :meth:`add_received_email` twice is routine rather
+        than exceptional.
+
+        Args:
+            message_id (str): The RFC ``Message-ID`` to check.
+
+        Returns:
+            bool: ``True`` if that id is already recorded.
+        """
+        if not message_id:
+            return False
+        async with self._session() as session:
+            result = await session.execute(
+                select(Email.id).where(Email.message_id == message_id).limit(1)
+            )
+            return result.scalar_one_or_none() is not None
 
     async def get_all_users(self) -> list[dict]:
         async with self._session() as session:
@@ -559,7 +838,7 @@ class Repository:
                     User.personal_email,
                     func.count(Conversation.id).label("conversation_count"),
                     func.sum(
-                        case((Conversation.status == "replied", 1), else_=0)
+                        case((Conversation.status == "closed", 1), else_=0)
                     ).label("replied_count"),
                     func.sum(
                         case((Conversation.status == "open", 1), else_=0)
@@ -592,6 +871,12 @@ class Repository:
         return result
 
     async def get_stats(self) -> dict:
+        """Site-wide conversation counters.
+
+        ``total_replied`` counts ``closed`` conversations — a conversation
+        closes precisely when a supplier reply binds to it, so the two mean
+        the same thing under the new lifecycle.
+        """
         async with self._session() as session:
             row = (
                 await session.execute(
@@ -599,10 +884,13 @@ class Repository:
                         func.count(func.distinct(Conversation.user_id)),
                         func.count(Conversation.id),
                         func.sum(
-                            case((Conversation.status == "replied", 1), else_=0)
+                            case((Conversation.status == "closed", 1), else_=0)
                         ),
                         func.sum(
                             case((Conversation.status == "open", 1), else_=0)
+                        ),
+                        func.sum(
+                            case((Conversation.status == "draft", 1), else_=0)
                         ),
                     )
                 )
@@ -612,6 +900,7 @@ class Repository:
             "total_conversations": row[1] or 0,
             "total_replied": int(row[2] or 0),
             "total_open": int(row[3] or 0),
+            "total_draft": int(row[4] or 0),
         }
 
     # ── Internal helpers ─────────────────────────────────────────────────
@@ -642,14 +931,19 @@ class Repository:
             "user_name": user_name,
             "supplier_email": conv.supplier_email,
             "supplier_name": conv.supplier_name,
-            "email_address": conv.reply_to_address,
-            "provider": conv.provider,
+            "supplier_type": conv.supplier_type or "",
+            "from_address": conv.from_address or "",
+            "provider": conv.provider or "",
+            "send_key": conv.send_key or "",
             "status": conv.status,
+            "last_action": conv.last_action or "",
             "created_at": conv.created_at.isoformat(),
             "reply_count": conv.reply_count,
             "last_reply_at": conv.last_reply_at.isoformat()
             if conv.last_reply_at
             else None,
+            "sent_at": conv.sent_at.isoformat() if conv.sent_at else None,
+            "closed_at": conv.closed_at.isoformat() if conv.closed_at else None,
             "product_name": conv.product_name,
             "quantity": conv.quantity,
             "target_price": conv.target_price,
@@ -673,6 +967,7 @@ class Repository:
             "subject": email.subject,
             "body_html": email.body_html,
             "body_text": email.body_text,
+            "message_id": email.message_id,
             "attachments": [
                 {
                     "filename": a.filename,
@@ -684,7 +979,14 @@ class Repository:
             ],
             ts_field: email.created_at.isoformat(),
         }
-        if email.direction == "received":
+        if email.direction == "sent":
+            result["provider_message_id"] = email.provider_message_id
+            result["status_code"] = email.status_code
+        else:
+            # matched_via makes threading bugs obvious at a glance in the UI:
+            # 'message_id' means the headers survived, 'subject_token' means
+            # they didn't and the subject prefix did the work.
+            result["matched_via"] = email.matched_via
             result["dkim"] = email.dkim
             result["spf"] = email.spf
             result["spam_score"] = (
@@ -708,9 +1010,26 @@ class Repository:
                 )
             )
 
-    def _generate_message_id(self) -> str:
-        domain = self.settings.default_outbound_domain or "local"
-        return f"<{uuid.uuid4().hex}@{domain}>"
+    @staticmethod
+    def _jsonable(value):
+        """Coerce a payload into something the JSONB column can store.
+
+        Inbound payloads carry ``datetime`` values and, occasionally, raw
+        ``bytes``; both make asyncpg's JSON encoder raise. Anything it does
+        not recognise is stringified rather than dropped, since this column
+        exists precisely so nothing is lost.
+        """
+        if isinstance(value, dict):
+            return {str(k): Repository._jsonable(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [Repository._jsonable(v) for v in value]
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        if isinstance(value, datetime):
+            return value.isoformat()
+        if isinstance(value, bytes):
+            return value.decode("utf-8", "replace")
+        return str(value)
 
     @staticmethod
     def _as_uuid(value: str | None) -> uuid.UUID | None:

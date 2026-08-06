@@ -1,13 +1,13 @@
 """Factory that builds inbound webhook parser instances.
 
 :class:`WebhookParserFactory` maps a provider key to the matching
-:class:`~src.webhook_factory.webhook_master.WebhookParserMaster` subclass
-so the single ``POST /webhooks/inbound`` route can decode that provider's
-payload. The app builds exactly one parser at startup
-(``src.app._INBOUND_EMAIL_PROVIDER``), since this one endpoint only
-understands one payload format at a time. It mirrors
-:class:`src.email_platform.factory.EmailProviderFactory` on the inbound
-side.
+:class:`~src.webhook_factory.webhook_master.WebhookParserMaster` subclass so
+``POST /webhooks/inbound/{provider_key}`` can decode that provider's payload.
+Parsers are now built (and cached) per provider on demand by
+:meth:`~src.services.conversation_service.ConversationService.get_parser`,
+so every provider's inbound mail is understood — not just the one that used
+to be pinned at startup. It mirrors
+:class:`src.email_platform.factory.EmailProviderFactory` on the inbound side.
 
 Example:
     >>> from src.webhook_factory.factory import WebhookParserFactory
@@ -23,6 +23,7 @@ import logging
 
 from src.config import Settings
 from src.email_platform.email_master import ProviderConfigError
+from src.webhook_factory.alibaba_webhook import AlibabaWebhookParser
 from src.webhook_factory.elasticemail_webhook import (
     ElasticEmailWebhookParser,
 )
@@ -34,17 +35,23 @@ from src.webhook_factory.webhook_master import WebhookParserMaster
 
 # Registry mapping the lowercase provider key to its parser class. Keep the
 # keys identical to those in the email-provider factory so the same
-# provider key can build either a send-side or receive-side instance.
+# provider key can build either a send-side or receive-side instance — the
+# service resolves a parser per inbound request now (see
+# ``POST /webhooks/inbound/{provider_key}``), not once at startup.
 #
-# NOTE: "sendcloud" maps to a stub parser (SendCloud's inbound webhook
-# payload has not been documented yet) — outbound sending works, inbound
-# replies fail with a clear "not implemented" error instead of crashing.
+# NOTE: "sendcloud"'s inbound payload shape is a best-effort guess (no
+# SendCloud inbound webhook doc available yet). "alibaba"/"alibaba_hk" map to
+# an adapter rather than a real HTTP parser: Alibaba has no inbound webhook,
+# so its mail arrives via IMAP polling and is converted from MIME instead.
 _PARSERS: dict[str, type[WebhookParserMaster]] = {
     "sendgrid": SendGridWebhookParser,
     "mailgun": MailgunWebhookParser,
     "elasticemail": ElasticEmailWebhookParser,
     "sendcloud": SendCloudWebhookParser,
+    "sendcloud_hk": SendCloudWebhookParser,
     "engagelab": EngageLabWebhookParser,
+    "alibaba": AlibabaWebhookParser,
+    "alibaba_hk": AlibabaWebhookParser,
 }
 
 
@@ -55,8 +62,8 @@ class WebhookParserFactory:
     the lookup-and-instantiate step.
 
     Example:
-        >>> WebhookParserFactory.supported()
-        ['sendgrid', 'mailgun', 'elasticemail', 'sendcloud', 'engagelab']
+        >>> "engagelab" in WebhookParserFactory.supported()
+        True
     """
 
     @classmethod

@@ -15,6 +15,10 @@ Field                Meaning
 ``subject``          Subject line
 ``body-plain``       Plain-text body
 ``body-html``        HTML body
+``message-headers``  JSON array of ``[name, value]`` header pairs
+``Message-Id``       Flattened copy of the same header
+``In-Reply-To``      Flattened copy — the primary threading signal
+``References``       Flattened copy — the secondary threading signal
 ``attachment-count`` Number of attachments (string integer)
 ``attachment-1``..N  Uploaded files
 ``timestamp``        Signature timestamp
@@ -114,6 +118,13 @@ class MailgunWebhookParser(WebhookParserMaster):
             or form.get("X-Mailgun-Sscore")
         )
 
+        # Mailgun flattens the common threading headers into their own form
+        # fields as well as listing them in message-headers; prefer the
+        # parsed header list and fall back to the flat fields.
+        message_id = headers.get("message-id") or form.get("Message-Id", "")
+        in_reply_to = headers.get("in-reply-to") or form.get("In-Reply-To", "")
+        references = headers.get("references") or form.get("References", "")
+
         inbound = InboundEmail(
             from_email=form.get("sender", ""),
             to_email=form.get("recipient", ""),
@@ -125,15 +136,21 @@ class MailgunWebhookParser(WebhookParserMaster):
             spf=headers.get("received-spf", ""),
             signature_verified=verified,
             provider=self.provider_name,
+            message_id=message_id,
+            in_reply_to=in_reply_to,
+            references=references,
+            headers=headers,
         )
 
         inbound.attachments = await self._extract_attachments(form)
         self.log.info(
-            "Parsed Mailgun inbound: %s -> %s (verified=%s, %d att.)",
+            "Parsed Mailgun inbound: %s -> %s (verified=%s, %d att., "
+            "message_id=%s)",
             inbound.from_email,
             inbound.to_email,
             verified,
             len(inbound.attachments),
+            inbound.message_id or "-",
         )
         return inbound
 

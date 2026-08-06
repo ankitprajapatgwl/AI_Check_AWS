@@ -4,8 +4,10 @@
 POSTing to Mailgun's ``/v3/{domain}/messages`` endpoint with the
 :mod:`requests` library — the approach shown throughout Mailgun's official
 Python documentation (Mailgun does not ship a first-party Python SDK). The
-``From`` header uses the verified sender and the ``Reply-To`` header (sent
-as the ``h:Reply-To`` form field) carries the dynamic conversation address.
+``From`` header uses the verified sender; the RFC ``Message-ID`` this app
+mints rides along as the ``h:Message-Id`` form field (``h:``-prefixed fields
+are passed through as raw headers). No ``Reply-To`` is sent — replies thread
+on ``Message-ID``/``References`` and the ``[RFQ - id]`` subject prefix.
 
 Configuration consumed (see :class:`src.config.Settings`):
 
@@ -15,8 +17,8 @@ Configuration consumed (see :class:`src.config.Settings`):
 - ``MAILGUN_API_BASE`` – ``https://api.mailgun.net`` (US, default) or
   ``https://api.eu.mailgun.net`` (EU).
 - ``MAILGUN_OUTBOUND_DOMAIN`` *(required)* – domain used to build the
-  ``From`` and dynamic Reply-To addresses (keep it equal to
-  ``MAILGUN_DOMAIN`` above unless you know Mailgun accepts a mismatch).
+  ``From`` address (keep it equal to ``MAILGUN_DOMAIN`` above unless you
+  know Mailgun accepts a mismatch).
 - ``MAILGUN_COMPANY_NAME`` – display name in the ``From`` header (defaults
   to ``"Your Company"``).
 
@@ -63,8 +65,8 @@ class MailgunEmailProvider(EmailMaster):
         >>> result = provider.send_email(            # doctest: +SKIP
         ...     from_email="noreply@yourdomain.com", from_name="Acme",
         ...     to_email="buyer@x.com", to_name="Buyer",
-        ...     subject="Hi", html_body="<p>Hi</p>",
-        ...     reply_to="usr42_conv3fa9c1b2@mail.yourdomain.com")
+        ...     subject="[RFQ - hd273hsd] - Hi", html_body="<p>Hi</p>",
+        ...     message_id="<rfq.hd273hsd.ab@mail.yourdomain.com>")
         >>> result["provider"]                       # doctest: +SKIP
         'mailgun'
     """
@@ -117,14 +119,17 @@ class MailgunEmailProvider(EmailMaster):
         to_name: str,
         subject: str,
         html_body: str,
-        reply_to: str,
+        message_id: str,
+        extra_headers: dict[str, str] | None = None,
         attachments: list | None = None,
     ) -> dict:
         """Send one email via the Mailgun messages API.
 
         Submits an HTTP Basic-authenticated ``POST`` with the standard
         Mailgun form fields. A ``2xx`` response means Mailgun queued the
-        message; the response JSON contains the Mailgun message id.
+        message; the response JSON contains the Mailgun message id. No
+        ``Reply-To`` is sent — replies thread on ``Message-ID``/``References``
+        and the ``[RFQ - id]`` subject prefix.
 
         Args:
             from_email (str): Verified sender address.
@@ -133,12 +138,15 @@ class MailgunEmailProvider(EmailMaster):
             to_name (str): Recipient display name.
             subject (str): Subject line.
             html_body (str): HTML body.
-            reply_to (str): Dynamic conversation address sent as
-                ``h:Reply-To``.
+            message_id (str): The RFC ``Message-ID`` this app minted, sent as
+                the ``h:Message-Id`` form field.
+            extra_headers (dict[str, str] | None): Extra headers, each sent
+                as its own ``h:{name}`` field.
+            attachments (list | None): Optional attachments.
 
         Returns:
             dict: ``{"status_code": int, "provider": "mailgun",
-                "provider_message_id": str | None}``.
+                "provider_message_id": str | None, "message_id": str}``.
 
         Raises:
             EmailSendError: If the request fails at the network level or
@@ -148,9 +156,9 @@ class MailgunEmailProvider(EmailMaster):
             >>> provider.send_email(                  # doctest: +SKIP
             ...     from_email="noreply@yourdomain.com",
             ...     from_name="Acme", to_email="buyer@x.com",
-            ...     to_name="Buyer", subject="Hi",
+            ...     to_name="Buyer", subject="[RFQ - hd273hsd] - Hi",
             ...     html_body="<p>Hi</p>",
-            ...     reply_to="usr42_conv3fa9c1b2@mail.yourdomain.com")
+            ...     message_id="<rfq.hd273hsd.ab@mail.yourdomain.com>")
             {'status_code': 200, 'provider': 'mailgun', ...}
         """
         # Mailgun accepts a combined "Display Name <address>" recipient.
@@ -162,8 +170,10 @@ class MailgunEmailProvider(EmailMaster):
             "subject": subject,
             "html": html_body,
             # ``h:`` prefixed fields are passed through as raw headers.
-            "h:Reply-To": reply_to,
+            "h:Message-Id": message_id,
         }
+        for key, value in (extra_headers or {}).items():
+            payload[f"h:{key}"] = value
 
         files = [
             ("attachment", (att["filename"], att["content"],
@@ -198,9 +208,11 @@ class MailgunEmailProvider(EmailMaster):
                 f"(status {response.status_code}): {response.text[:200]}"
             )
 
-        message_id = None
+        # Mailgun's own id for the queued message, distinct from the RFC
+        # Message-ID we minted and sent as ``h:Message-Id``.
+        provider_message_id = None
         try:
-            message_id = response.json().get("id")
+            provider_message_id = response.json().get("id")
         except ValueError:
             # Non-JSON body is unexpected but not fatal; the send succeeded.
             self.log.warning("Mailgun returned a non-JSON success body")
@@ -213,5 +225,6 @@ class MailgunEmailProvider(EmailMaster):
         return {
             "status_code": response.status_code,
             "provider": self.provider_name,
-            "provider_message_id": message_id,
+            "provider_message_id": provider_message_id,
+            "message_id": message_id,
         }

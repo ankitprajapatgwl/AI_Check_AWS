@@ -10,10 +10,15 @@ builds the ``Authorization: Basic base64(api_user:api_key)`` header when
 given ``auth=(api_user, api_key)``.
 
 Because the verified subdomain (``ENGAGELAB_OUTBOUND_DOMAIN``) is fully
-authenticated, EngageLab allows the local-part of the ``from``/``reply_to``
-addresses to be defined dynamically at send time with no per-address
-pre-registration — see :meth:`EmailMaster.build_dynamic_email` /
+authenticated, EngageLab allows the local-part of the ``from`` address to be
+defined dynamically at send time with no per-address pre-registration — see
 :meth:`EmailMaster.build_sending_email`.
+
+Threading rides on ``body.headers``: the RFC ``Message-ID`` this app mints
+plus ``X-RFQ-Conversation-Id`` are passed through there. EngageLab documents
+that object as capped at 1 KB with a forbidden-key list that does not include
+``Message-ID`` (``setup_docs/engagelab_guide/email_send_guice.md:87``). No
+``reply_to`` is sent at all.
 
 Configuration consumed (see :class:`src.config.Settings`):
 
@@ -22,8 +27,8 @@ Configuration consumed (see :class:`src.config.Settings`):
 - ``ENGAGELAB_API_KEY`` *(required)* – API_KEY generated for that API_USER.
 - ``ENGAGELAB_API_BASE`` – region base URL (Singapore by default).
 - ``ENGAGELAB_OUTBOUND_DOMAIN`` *(required)* – the verified sending
-  subdomain, used to build the ``From`` and dynamic Reply-To addresses for
-  sends made through EngageLab.
+  subdomain, used to build the ``From`` address for sends made through
+  EngageLab.
 - ``ENGAGELAB_COMPANY_NAME`` – display name in the ``from`` header (defaults
   to ``"Your Company"``).
 
@@ -69,10 +74,10 @@ class EngageLabEmailProvider(EmailMaster):
     Example:
         >>> provider = EngageLabEmailProvider(settings, logger)
         >>> result = provider.send_email(              # doctest: +SKIP
-        ...     from_email="JamesWhitfield.3fa9c1b2@mail.jobsetu.online",
+        ...     from_email="JamesWhitfield@mail.jobsetu.online",
         ...     from_name="Acme", to_email="buyer@x.com", to_name="Buyer",
-        ...     subject="Hi", html_body="<p>Hi</p>",
-        ...     reply_to="JamesWhitfield.3fa9c1b2@mail.jobsetu.online")
+        ...     subject="[RFQ - hd273hsd] - Hi", html_body="<p>Hi</p>",
+        ...     message_id="<rfq.hd273hsd.ab@mail.jobsetu.online>")
         >>> result["provider"]                         # doctest: +SKIP
         'engagelab'
     """
@@ -121,28 +126,30 @@ class EngageLabEmailProvider(EmailMaster):
         to_name: str,
         subject: str,
         html_body: str,
-        reply_to: str,
+        message_id: str,
+        extra_headers: dict[str, str] | None = None,
         attachments: list | None = None,
     ) -> dict:
         """Send one email via the EngageLab ``POST /v1/mail/send`` endpoint.
 
         Submits a JSON ``POST`` authenticated with HTTP Basic Auth
-        (``api_user``/``api_key``). Both ``from`` and ``reply_to`` carry the
-        dynamic conversation address so supplier replies route back through
-        this app's inbound webhook.
+        (``api_user``/``api_key``). No ``reply_to`` is sent — replies are
+        threaded by ``Message-ID``/``References`` and the ``[RFQ - id]``
+        subject prefix, so a reply simply goes back to ``from``.
 
         Args:
-            from_email (str): Dynamic sender address for the ``from``
-                header (suffix must match the verified
-                ``ENGAGELAB_OUTBOUND_DOMAIN``).
+            from_email (str): Sender address for the ``from`` header (suffix
+                must match the verified ``ENGAGELAB_OUTBOUND_DOMAIN``).
             from_name (str): Display name for the ``from`` header.
             to_email (str): Recipient address.
             to_name (str): Recipient display name (unused by the API but
                 accepted for interface parity).
             subject (str): Subject line.
             html_body (str): HTML body.
-            reply_to (str): Dynamic conversation address sent as
-                ``reply_to``.
+            message_id (str): The RFC ``Message-ID`` this app minted, passed
+                through EngageLab's ``body.headers`` object.
+            extra_headers (dict[str, str] | None): Extra headers merged into
+                the same object, e.g. ``X-RFQ-Conversation-Id``.
             attachments (list | None): Optional attachments, each base64
                 encoded into the ``body.attachments`` array per EngageLab's
                 documented schema (``filename``, ``type``, ``content``,
@@ -150,7 +157,7 @@ class EngageLabEmailProvider(EmailMaster):
 
         Returns:
             dict: ``{"status_code": int, "provider": "engagelab",
-                "provider_message_id": str | None}``.
+                "provider_message_id": str | None, "message_id": str}``.
 
         Raises:
             EmailSendError: If the request fails at the network level, the
@@ -158,17 +165,22 @@ class EngageLabEmailProvider(EmailMaster):
 
         Example:
             >>> provider.send_email(                   # doctest: +SKIP
-            ...     from_email="JamesWhitfield.3fa9c1b2@mail.jobsetu.online",
+            ...     from_email="JamesWhitfield@mail.jobsetu.online",
             ...     from_name="Acme", to_email="buyer@x.com",
-            ...     to_name="Buyer", subject="Hi",
+            ...     to_name="Buyer", subject="[RFQ - hd273hsd] - Hi",
             ...     html_body="<p>Hi</p>",
-            ...     reply_to="JamesWhitfield.3fa9c1b2@mail.jobsetu.online")
+            ...     message_id="<rfq.hd273hsd.ab@mail.jobsetu.online>")
             {'status_code': 200, 'provider': 'engagelab', ...}
         """
         mail_body: dict = {
-            "reply_to": [reply_to],
             "subject": subject,
             "content": {"html": html_body},
+            # EngageLab documents a `headers` object (max 1 KB) whose
+            # forbidden-key list does not include Message-ID — see
+            # setup_docs/engagelab_guide/email_send_guice.md:87. If a future
+            # API change starts rewriting it, matching degrades to the
+            # subject token, which is still correct.
+            "headers": {"Message-ID": message_id, **(extra_headers or {})},
             "settings": {
                 "send_mode": _SEND_MODE_TRANSACTIONAL,
                 "return_email_id": True,
@@ -223,7 +235,7 @@ class EngageLabEmailProvider(EmailMaster):
                 f"(status {response.status_code}): {response.text[:200]}"
             )
 
-        message_id = None
+        provider_message_id = None
         try:
             body = response.json()
         except ValueError:
@@ -233,14 +245,15 @@ class EngageLabEmailProvider(EmailMaster):
 
         # Per EngageLab's documented response schema, individual sends
         # return "email_ids" (one per recipient); address-list sends
-        # (send_mode=2) return "task_id" instead.
+        # (send_mode=2) return "task_id" instead. This is EngageLab's own id,
+        # kept separate from the RFC Message-ID we minted and sent.
         email_ids = body.get("email_ids")
         if isinstance(email_ids, list) and email_ids:
-            message_id = email_ids[0]
+            provider_message_id = email_ids[0]
         elif body.get("task_id"):
-            message_id = body["task_id"]
+            provider_message_id = body["task_id"]
         elif body.get("request_id"):
-            message_id = body["request_id"]
+            provider_message_id = body["request_id"]
 
         self.log.info(
             "EngageLab accepted email to %s (status=%s)",
@@ -250,5 +263,6 @@ class EngageLabEmailProvider(EmailMaster):
         return {
             "status_code": response.status_code,
             "provider": self.provider_name,
-            "provider_message_id": message_id,
+            "provider_message_id": provider_message_id,
+            "message_id": message_id,
         }

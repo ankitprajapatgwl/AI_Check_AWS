@@ -21,6 +21,10 @@ Example:
 import logging
 
 from src.config import Settings
+from src.email_platform.alibaba_provider import (
+    AlibabaEnterpriseProvider,
+    AlibabaHKEnterpriseProvider,
+)
 from src.email_platform.elasticemail_provider import ElasticEmailProvider
 from src.email_platform.email_master import EmailMaster, ProviderConfigError
 from src.email_platform.engagelab_provider import EngageLabEmailProvider
@@ -33,11 +37,13 @@ from src.email_platform.sendgrid_provider import SendGridEmailProvider
 
 # Registry mapping the lowercase provider key to its implementation class.
 # Add a new provider by writing its class and registering it here — nothing
-# else in the application needs to change. "sendcloud_hk" is not a
-# user-facing "Provider" choice on the Send RFQ form — it's the internal key
-# src.route resolves to when the sender picks SendCloud for a Chinese
-# supplier (see src.route._SEND_KEYS), pinning the send to SendCloud's Hong
-# Kong/CN region instead of its Singapore default.
+# else in the application needs to change.
+#
+# "sendcloud_hk" and "alibaba_hk" are not user-facing "Provider" choices on
+# the Send RFQ form — they're the internal keys src.route resolves to when
+# the sender picks SendCloud/Alibaba for a Chinese supplier (see
+# src.route._SEND_KEYS), pinning the send to that provider's Hong Kong region
+# instead of its Singapore default.
 _PROVIDERS: dict[str, type[EmailMaster]] = {
     "sendgrid": SendGridEmailProvider,
     "mailgun": MailgunEmailProvider,
@@ -45,6 +51,8 @@ _PROVIDERS: dict[str, type[EmailMaster]] = {
     "sendcloud": SendCloudEmailProvider,
     "sendcloud_hk": SendCloudHKEmailProvider,
     "engagelab": EngageLabEmailProvider,
+    "alibaba": AlibabaEnterpriseProvider,
+    "alibaba_hk": AlibabaHKEnterpriseProvider,
 }
 
 
@@ -55,8 +63,8 @@ class EmailProviderFactory:
     the lookup-and-instantiate step.
 
     Example:
-        >>> EmailProviderFactory.supported()
-        ['sendgrid', 'mailgun', 'elasticemail', 'sendcloud', 'sendcloud_hk', 'engagelab']
+        >>> "alibaba_hk" in EmailProviderFactory.supported()
+        True
     """
 
     @classmethod

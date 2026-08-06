@@ -223,6 +223,10 @@
       border-radius: 99px;
       font-size: 12px; font-weight: 600;
     }
+    /* Conversation lifecycle: draft -> open -> closed, or -> failed.
+       badge-replied/badge-declined keep their names (and colours) but now
+       read "Closed"/"Failed" in the templates. */
+    .badge-draft    { background: var(--bg); color: var(--txt2); border: 1px solid var(--border); }
     .badge-open     { background: #DBEAFE; color: #1E40AF; }
     .badge-replied  { background: var(--success-bg); color: var(--success-txt); }
     .badge-declined { background: var(--danger-bg); color: var(--danger-txt); }

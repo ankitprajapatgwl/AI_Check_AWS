@@ -7,16 +7,17 @@ ready-to-serve :data:`app` object that Uvicorn imports
 1. Load configuration (:func:`src.config.get_settings`).
 2. Configure the single shared logger from ``LOG_LEVEL``.
 3. Build the async Postgres engine/session factory.
-4. Build the default outbound email provider and the inbound webhook
-   parser (:data:`_INBOUND_EMAIL_PROVIDER`) via their factories. Outbound
-   sending is no longer pinned to one app-wide provider — the sender picks
-   a provider per send on the Send RFQ form (see :mod:`src.route`), and
+4. Build the default outbound email provider and inbound webhook parser
+   (:data:`_INBOUND_EMAIL_PROVIDER`) via their factories. Neither sending
+   nor receiving is pinned to that one provider anymore: the sender picks a
+   provider per send on the Send RFQ form, inbound arrives at
+   ``POST /webhooks/inbound/{provider}``, and
    :class:`~src.services.conversation_service.ConversationService` builds
-   the rest on demand. Inbound webhook parsing still needs exactly one
-   fixed parser, since ``POST /webhooks/inbound`` only understands one
-   payload format at a time.
+   and caches the rest on demand.
 5. Assemble the :class:`ConversationService`.
 6. Mount static directories, register templates and include the routes.
+7. On startup, launch one background IMAP poller per configured Alibaba
+   region (Alibaba has no inbound webhook) — see :func:`lifespan`.
 
 Every collaborator is attached to ``app.state`` so the thin handlers in
 :mod:`src.route` can reach them without re-constructing anything.
@@ -27,6 +28,7 @@ Example:
     'EmailPOC'
 """
 
+import asyncio
 import sys
 import time
 import uuid
@@ -42,6 +44,7 @@ from src.config import BASE_DIR, BASE_PATH, BEDROCK_BASE_PATH, get_settings
 from src.db.repository import Repository
 from src.db.session import create_engine_and_sessionmaker
 from src.email_platform.factory import EmailProviderFactory
+from src.inbound.alibaba_imap_poller import build_alibaba_pollers
 from src.logger import AppLogger
 from src.route import router
 from src.services.conversation_service import ConversationService
@@ -62,12 +65,18 @@ if str(_BEDROCK_DIR) not in sys.path:
 from app import health as bedrock_health  # noqa: E402
 from app import router as bedrock_router  # noqa: E402
 
-# The only provider with a real inbound webhook parser implemented (see
-# src/webhook_factory/factory.py — SendCloud's is a documented stub).
-# Outbound sending is not limited to this provider: the sender picks any
-# factory-registered provider per send on the Send RFQ form. This fixed
-# choice only governs which payload format the single
-# ``POST /webhooks/inbound`` endpoint understands.
+# Default provider, used for two things only:
+#
+# 1. Which parser the legacy un-suffixed ``POST /webhooks/inbound`` path
+#    falls back to, so provider dashboards configured before the
+#    per-provider ``/webhooks/inbound/{provider}`` routes existed keep
+#    working (see src/route.py::_DEFAULT_INBOUND_PROVIDER).
+# 2. Eager credential validation at startup, so a misconfigured default
+#    fails fast rather than on the first request.
+#
+# Every other provider's parser and sender are built on demand — inbound is
+# no longer restricted to one payload format (see
+# ConversationService.get_parser / get_provider).
 _INBOUND_EMAIL_PROVIDER = "engagelab"
 
 
@@ -124,7 +133,35 @@ def create_app() -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        """Run the Alibaba IMAP pollers for the lifetime of the app.
+
+        Every other provider pushes inbound mail to
+        ``POST /webhooks/inbound/{provider}``; Alibaba has no such hook, so
+        its replies are pulled by a background task per configured region
+        (see src/inbound/alibaba_imap_poller.py). Both feed the same
+        ConversationService.process_inbound pipeline.
+
+        NOTE: with more than one replica, every replica polls the same
+        mailbox. Set ALIBABA_INBOUND_ENABLED=false on all but one.
+        """
+        tasks: list[asyncio.Task] = []
+        if settings.alibaba_inbound_enabled:
+            for poller in build_alibaba_pollers(service, settings, logger):
+                tasks.append(asyncio.create_task(poller.run_forever()))
+            if not tasks:
+                logger.info(
+                    "ALIBABA_INBOUND_ENABLED is true but no Alibaba mailbox "
+                    "is configured — no IMAP poller started"
+                )
+        else:
+            logger.info("Alibaba IMAP polling disabled by configuration")
+
         yield
+
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         await engine.dispose()
 
     # 4. Assemble the FastAPI app and register everything.

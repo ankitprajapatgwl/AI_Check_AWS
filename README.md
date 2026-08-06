@@ -5,8 +5,10 @@ repo (`src/app.py` mounts the Bedrock POC's routes into the same FastAPI app
 EmailPOC runs):
 
 - **EmailPOC** — RFQ (Request for Quotation) email conversations with
-  suppliers using dynamic email addressing, backed by PostgreSQL. Served at
-  **`/email_poc`**. See [`RFQ_EMAIL_FLOW.md`](RFQ_EMAIL_FLOW.md),
+  suppliers, threaded by RFC `Message-ID` plus an `[RFQ - id]` subject
+  prefix, backed by PostgreSQL. Served at **`/email_poc`**. See
+  [Conversation lifecycle & threading](#conversation-lifecycle--threading)
+  below, plus [`RFQ_EMAIL_FLOW.md`](RFQ_EMAIL_FLOW.md),
   [`registration_guide.md`](registration_guide.md) and
   [`email_tracking.md`](email_tracking.md) for how the app itself works.
 - **Bedrock Availability POC** ([`bedrock_availability_poc/`](bedrock_availability_poc/)) —
@@ -41,7 +43,10 @@ need Python, `uv`, or Postgres installed on your machine.
 
 - **EmailPOC**: an `API_USER`/`API_KEY` pair from either
   [EngageLab](setup_docs/engagelab_guide/engagelab_setup.md) or
-  [SendCloud](setup_docs/aurora_send_cloud), plus a sending domain.
+  [SendCloud](setup_docs/aurora_send_cloud), plus a sending domain — or, for
+  [Alibaba Enterprise Mail](setup_docs/alibaba_guide/Alibaba_Documentation.md),
+  a mailbox and its third-party client security password (Alibaba is SMTP/IMAP
+  rather than a REST API).
 - **Bedrock Availability POC**: AWS credentials (access key/secret, or a
   profile) with `bedrock:ListFoundationModels` and `bedrock:InvokeModel`.
   Optionally an `ANTHROPIC_API_KEY` for the extra direct-API check.
@@ -153,11 +158,105 @@ instead of merged into this app).
   Docker quick start above (Option A). One `.env`, shared by both
   containers.
 - [`.env.example`](.env.example) — the template for manual/local EmailPOC
-  development (Option B), covering EngageLab, SendCloud, and the Bedrock
-  Availability POC's AWS/Anthropic variables.
+  development (Option B), covering EngageLab, SendCloud, Alibaba Enterprise
+  Mail, `MESSAGE_ID_DOMAIN`, and the Bedrock Availability POC's
+  AWS/Anthropic variables.
 - [`bedrock_availability_poc/.env.example`](bedrock_availability_poc/.env.example) —
   the template for running the Bedrock POC entirely standalone (its own
   `.env`, independent of the root one).
 
 Copy whichever applies to `.env` and fill in your values — each app fails
 fast at startup with a clear message if something required is missing.
+
+---
+
+## Conversation lifecycle & threading
+
+### Lifecycle
+
+A conversation is created **before** anything is sent, so a failed send
+still leaves a record of what was attempted:
+
+```
+  create draft            send RFQ              reply matched
+ ─────────────►  draft  ───────────►  open  ───────────────►  closed
+                          │
+                          └── provider rejected ──►  failed
+```
+
+| Status   | Meaning                                                       |
+| -------- | ------------------------------------------------------------- |
+| `draft`  | `conv_id` and subject assigned; nothing sent yet              |
+| `open`   | RFQ sent and accepted by the provider; awaiting a reply       |
+| `closed` | A supplier reply was matched to it                            |
+| `failed` | The provider rejected the send                                |
+
+The old keyword classifier still runs, but its verdict (`QUOTE_RECEIVED`,
+`DECLINED`, …) is stored in `conversations.last_action` for information
+only — it no longer decides the status.
+
+### Subject contract
+
+Every outbound RFQ subject is exactly:
+
+```
+[RFQ - {conv_id}] - {subject line}
+```
+
+e.g. `[RFQ - hd273hsd] - Request for Quotation — Stainless Steel Water Bottle`
+(Chinese suppliers get `询价请求 — …`). **Keeping this prefix intact is all a
+supplier has to do for their reply to be matched.**
+
+### How a reply is matched
+
+There is no per-conversation reply address. Each outbound RFQ carries an
+app-minted `Message-ID` (`<rfq.{conv_id}.{uuid}@{MESSAGE_ID_DOMAIN}>`) and an
+`X-RFQ-Conversation-Id` header, and inbound mail is matched in this order:
+
+| # | Signal                                    | `matched_via`    |
+| - | ----------------------------------------- | ---------------- |
+| 1 | `In-Reply-To` / `References` → our stored `Message-ID` | `message_id`     |
+| 2 | `X-RFQ-Conversation-Id` header            | `header_token`   |
+| 3 | `[RFQ - id]` subject prefix               | `subject_token`  |
+| 4 | *(none matched)* → stored in `unmatched_emails` + `unmatched_attachments`, nothing dropped | — |
+
+Step 1 is the correct answer whenever the supplier used their client's Reply
+button; step 3 is the guaranteed fallback that survives header-stripping
+gateways and manual forwards. `matched_via` is shown on every received
+message in the conversation thread, which makes threading regressions
+obvious at a glance.
+
+Re-delivering the same message (a webhook retry, an IMAP re-poll) is a no-op
+— `emails.message_id` is `UNIQUE` and is checked before insert.
+
+### Inbound URLs
+
+Point each provider's inbound webhook at **its own** path:
+
+```
+/email_poc/webhooks/inbound/{provider}
+```
+
+e.g. `/email_poc/webhooks/inbound/engagelab`,
+`/email_poc/webhooks/inbound/sendcloud`. The un-suffixed
+`/email_poc/webhooks/inbound` still works and resolves to the default
+provider (EngageLab), so dashboards configured earlier keep delivering.
+
+**Alibaba is the exception**: it has no inbound webhook, so its replies are
+polled over IMAP by a background task instead — see
+[`setup_docs/alibaba_guide/Alibaba_Documentation.md`](setup_docs/alibaba_guide/Alibaba_Documentation.md).
+
+### Providers and regions
+
+The Send RFQ form takes a **Provider** and a **Supplier Type**, and the pair
+resolves to the region actually used:
+
+| Provider           | Chinese →      | Non-Chinese → |
+| ------------------ | -------------- | ------------- |
+| SendCloud          | `sendcloud_hk` | `sendcloud`   |
+| EngageLab          | `engagelab`    | `engagelab`   |
+| Alibaba Enterprise | `alibaba_hk`   | `alibaba`     |
+
+Chinese suppliers also get the Simplified-Chinese body template
+(`templates/emails/rfq_email_zh.html`); everyone else gets the English one.
+Both are **HTML only** — no `text/plain` alternative is produced anywhere.

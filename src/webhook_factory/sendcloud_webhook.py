@@ -73,16 +73,26 @@ class SendCloudWebhookParser(WebhookParserMaster):
             WebhookParseError: If the form fields cannot be read.
         """
         try:
+            raw_eml = await self._raw_message(form)
+            msg = (
+                email.message_from_string(raw_eml, policy=default)
+                if raw_eml
+                else None
+            )
+            headers = self._headers(form.get("headers"), msg)
             data = {
                 "from": form.get("from", ""),
                 "to": form.get("to", ""),
-                "subject": form.get("subject", ""),
+                "subject": form.get("subject")
+                or headers.get("subject", ""),
                 "text": form.get("text", ""),
                 "html": form.get("html", ""),
                 "spam_score": form.get("spam_score", "0") or "0",
                 "dkim": form.get("dkim", ""),
                 "spf": form.get("SPF", ""),
-                "attachments": await self._extract_attachments(form),
+                "headers": headers,
+                "raw_message": raw_eml,
+                "attachments": self.attachments_from_mime(msg),
             }
         except Exception as exc:  # noqa: BLE001 - normalise to one type
             self.log.error("Failed to extract SendCloud multipart fields: %s", exc)
@@ -118,6 +128,8 @@ class SendCloudWebhookParser(WebhookParserMaster):
                 "spam_score": payload.get("spam_score", 0),
                 "dkim": payload.get("dkim", ""),
                 "spf": payload.get("SPF") or payload.get("spf", ""),
+                "headers": self._headers(payload.get("headers"), None),
+                "raw_message": payload.get("raw_message") or "",
                 "attachments": self._attachments_from_json(
                     payload.get("attachments", [])
                 ),
@@ -184,6 +196,7 @@ class SendCloudWebhookParser(WebhookParserMaster):
         except (TypeError, ValueError):
             spam_score = 0.0
 
+        headers = parsed.get("headers", {})
         inbound = InboundEmail(
             from_email=parsed.get("from", ""),
             to_email=parsed.get("to", ""),
@@ -194,58 +207,95 @@ class SendCloudWebhookParser(WebhookParserMaster):
             dkim=parsed.get("dkim", ""),
             spf=parsed.get("spf", ""),
             provider=self.provider_name,
+            message_id=headers.get("message-id", ""),
+            in_reply_to=headers.get("in-reply-to", ""),
+            references=headers.get("references", ""),
+            headers=headers,
+            raw_message=parsed.get("raw_message", ""),
         )
         inbound.attachments = parsed.get("attachments", [])
 
         self.log.info(
-            "Parsed SendCloud inbound: %s -> %s (%d attachment(s))",
+            "Parsed SendCloud inbound: %s -> %s (%d attachment(s), "
+            "message_id=%s)",
             inbound.from_email,
             inbound.to_email,
             len(inbound.attachments),
+            inbound.message_id or "-",
         )
         return inbound
 
-    async def _extract_attachments(self, form) -> list[RawAttachment]:
-        """Extract attachments from the raw_message text string or raw_message_url."""
-        attachments: list[RawAttachment] = []
+    async def _raw_message(self, form) -> str:
+        """Return the inbound message's raw MIME source, downloading if needed.
 
-        # 1. Capture the raw EML string content
+        SendCloud inlines it in ``raw_message`` when small enough, otherwise
+        exposes ``raw_message_url``. A failed download returns ``""`` rather
+        than raising — without the headers, matching falls back to the
+        subject token instead of losing the reply.
+
+        Args:
+            form: The parsed multipart form mapping.
+
+        Returns:
+            str: The raw ``.eml`` source, or ``""`` if unavailable.
+        """
         raw_eml = form.get("raw_message")
+        raw_url = form.get("raw_message_url")
 
-        # Alternative strategy: If raw_message is empty or clipped, stream it from the URL
-        if not raw_eml and form.get("raw_message_url"):
+        if not raw_eml and raw_url:
             self.log.debug("raw_message blank, downloading from raw_message_url...")
-            async with httpx.AsyncClient() as client:
-                response = await client.get(form.get("raw_message_url"))
+            try:
+                async with httpx.AsyncClient() as client:
+                    response = await client.get(raw_url, timeout=10.0)
                 if response.status_code == 200:
                     raw_eml = response.text
+                else:
+                    self.log.error(
+                        "SendCloud raw_message_url returned status %d",
+                        response.status_code,
+                    )
+            except httpx.HTTPError as exc:
+                self.log.error(
+                    "Could not download SendCloud raw_message_url %s: %s",
+                    raw_url,
+                    exc,
+                )
 
         if not raw_eml:
             self.log.debug("No raw message stream discovered in webhook payload.")
-            return []
+        return raw_eml or ""
 
-        # 2. Parse the EML string into an email object
-        msg = email.message_from_string(raw_eml, policy=default)
+    def _headers(self, raw_headers, msg) -> dict[str, str]:
+        """Build the lowercase header dict from the payload and/or raw MIME.
 
-        # 3. Walk through email parts to locate binary items
-        for part in msg.walk():
-            # Skip structures that aren't file configurations
-            if (
-                part.get_content_disposition() != "attachment"
-                and not part.get_filename()
-            ):
-                continue
+        SendCloud's inbound payload shape is unconfirmed, so ``headers`` may
+        arrive as a JSON string, an object, or not at all — whatever is
+        present is merged, then overridden by the real MIME headers when a
+        raw source was available.
 
-            filename = part.get_filename() or "unnamed_attachment"
-            content_type = part.get_content_type() or "application/octet-stream"
+        Args:
+            raw_headers: The payload's ``headers`` value, if any.
+            msg: The parsed MIME message, or ``None``.
 
-            # Extract payload bytes directly (automatically handles base64/quoted-printable decoding)
-            content = part.get_payload(decode=True)
-
-            if content:
-                attachments.append(RawAttachment(filename, content_type, content))
-
-        return attachments
+        Returns:
+            dict[str, str]: Lowercase header name → value.
+        """
+        headers: dict[str, str] = {}
+        if isinstance(raw_headers, str) and raw_headers.strip():
+            try:
+                raw_headers = json.loads(raw_headers)
+            except ValueError:
+                # Not JSON — most likely a raw "Name: Value" header block.
+                parsed = email.message_from_string(raw_headers, policy=default)
+                headers.update(self.headers_from_mime(parsed))
+                raw_headers = None
+        if isinstance(raw_headers, dict):
+            headers.update(
+                {str(k).lower(): str(v) for k, v in raw_headers.items()}
+            )
+        if msg is not None:
+            headers.update(self.headers_from_mime(msg))
+        return headers
 
     def _attachments_from_json(self, raw_attachments) -> list[RawAttachment]:
         """Decode base64 attachment entries from a SendCloud JSON payload.

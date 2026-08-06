@@ -1,0 +1,54 @@
+{# Shared RFQ body — English (non-Chinese suppliers).
+
+   HTML only: this is the entire message body, with no text/plain
+   alternative anywhere in the pipeline (requirement 8). Every style is
+   inline because email clients strip <style> blocks.
+
+   Variables: company, conv_id, supplier_name, product_name, quantity,
+   target_price. Rendered by src/email_platform/rfq_renderer.py. #}
+<div style="font-family: Arial, Helvetica, sans-serif; font-size: 14px; color: #222; max-width: 600px;">
+
+  <img src="https://placehold.co/320x40/blue/white?text={{ company | urlencode }}"
+       alt="{{ company }}" width="320" height="40"
+       style="display:block; margin-bottom:16px;">
+
+  <p>Dear {{ supplier_name }},</p>
+
+  <p>I am writing to request a formal quotation for the following:</p>
+
+  <table border="1" cellpadding="8" cellspacing="0"
+         style="border-collapse: collapse; width: 100%;">
+    <tr style="background-color: #f5f5f5;">
+      <th align="left">Product</th>
+      <th align="left">Quantity</th>
+      <th align="left">Target Price</th>
+    </tr>
+    <tr>
+      <td>{{ product_name }}</td>
+      <td>{{ quantity }} units</td>
+      <td>{{ target_price }} per unit</td>
+    </tr>
+  </table>
+
+  <p>Please include the following in your quotation:</p>
+  <ul>
+    <li>Unit price at stated quantity (FOB)</li>
+    <li>Minimum order quantity (MOQ)</li>
+    <li>Lead time and production capacity</li>
+    <li>Payment terms</li>
+    <li>Product specifications and certifications</li>
+  </ul>
+
+  <p>We look forward to your response within 3 business days.</p>
+
+  <p>Best regards,<br><strong>{{ company }} Sourcing Team</strong></p>
+
+  <hr style="border:none; border-top:1px solid #eee; margin-top:30px;">
+
+  {# Human-readable reference only. Nothing parses this — replies are matched
+     by Message-ID/References and the [RFQ - id] subject prefix. #}
+  <p style="font-size:11px; color:#aaa;">
+    Reference: [RFQ - {{ conv_id }}] — please keep the subject line intact
+    when replying so your quotation is matched to this request.
+  </p>
+</div>

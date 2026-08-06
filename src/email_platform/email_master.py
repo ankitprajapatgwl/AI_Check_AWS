@@ -1,18 +1,28 @@
 """Abstract base class and shared logic for every email provider.
 
-All outbound email providers (SendGrid, Mailgun, Elastic Email) inherit
-from :class:`EmailMaster`. The base class owns the behaviour that is
-identical no matter which provider actually transmits the message:
+All outbound email providers (SendGrid, Mailgun, Elastic Email, SendCloud,
+EngageLab, Alibaba Enterprise Mail) inherit from :class:`EmailMaster`. The
+base class owns the behaviour that is identical no matter which provider
+actually transmits the message:
 
 - :meth:`EmailMaster.generate_conversation_id` – mint a conversation id.
-- :meth:`EmailMaster.build_dynamic_email` – encode ``user_id`` /
-  ``conv_id`` into a per-conversation address.
 - :meth:`EmailMaster.build_sending_email` – build the stable per-user
-  ``From`` address (no conv_id) on this provider's own outbound domain.
-- :meth:`EmailMaster.parse_dynamic_email` – decode that address back into
-  its ``user_id`` / ``conv_id`` (also used by the inbound webhook).
-- :meth:`EmailMaster.build_rfq_subject` / :meth:`EmailMaster.build_rfq_html`
-  – render the standard RFQ subject line and HTML body.
+  ``From`` address on this provider's own outbound domain.
+- :meth:`EmailMaster.build_rfq_subject` – prefix the subject with
+  ``[RFQ - {conv_id}] - ``, and :meth:`EmailMaster.parse_conv_id_from_subject`
+  to recover the id from any reply carrying that prefix.
+- :meth:`EmailMaster.build_message_id` – mint the RFC 5322 ``Message-ID``
+  this app puts on the wire, and :meth:`EmailMaster.parse_message_ids` to
+  split an inbound ``In-Reply-To``/``References`` back into its ids.
+- :meth:`EmailMaster.build_rfq_html` – render the shared HTML-only RFQ body
+  (delegated to :class:`~src.email_platform.rfq_renderer.RfqRenderer`).
+
+**Threading contract.** There is no per-conversation dynamic reply address
+anymore. A reply is bound to its conversation by, in order, the RFC
+``In-Reply-To``/``References`` headers pointing at a ``Message-ID`` this app
+minted, our own ``X-RFQ-Conversation-Id`` header, and finally the
+``[RFQ - {conv_id}]`` subject prefix — the one signal that survives every
+provider and every mail client. No provider sets a ``Reply-To`` header.
 
 Each instance is constructed with its own :attr:`EmailMaster.outbound_domain`
 and :attr:`EmailMaster.company_name`, read generically from
@@ -34,9 +44,9 @@ Example:
     >>> provider = EmailProviderFactory.create(
     ...     "sendgrid", get_settings(), AppLogger.get())
     >>> cid = provider.generate_conversation_id()
-    >>> addr = provider.build_dynamic_email("42", cid)
-    >>> provider.parse_dynamic_email(addr)["user_id"]
-    '42'
+    >>> EmailMaster.parse_conv_id_from_subject(
+    ...     provider.build_rfq_subject(cid, "Request for Quotation")) == cid
+    True
 """
 
 import logging
@@ -46,6 +56,24 @@ from abc import ABC, abstractmethod
 from email.utils import parseaddr
 
 from src.config import Settings
+from src.email_platform.rfq_renderer import RfqRenderer
+
+# Recognises the ``[RFQ - HD273HSD]`` subject prefix anywhere in a subject
+# line. Module-level so the IMAP poller and the webhook parsers can import it
+# without constructing a provider.
+#
+# Deliberately looser than what :meth:`EmailMaster.build_rfq_subject` writes:
+# the token width is 6–16 characters (so the 8-char id can be widened later
+# without touching this parser), the separator accepts a plain hyphen or an
+# en/em dash, and whitespace is optional — mail clients and Chinese webmail
+# alike rewrite subjects more than you would hope. Matching with ``search``
+# means ``Re:``/``Fwd:``/``回复:``/``答复:`` prefixes are tolerated for free.
+SUBJECT_PREFIX_RE = re.compile(
+    r"\[\s*RFQ\s*[-–—]\s*([A-Za-z0-9]{6,16})\s*\]", re.IGNORECASE
+)
+
+# Matches one ``<id@host>`` token inside an In-Reply-To / References header.
+_MESSAGE_ID_RE = re.compile(r"<[^<>\s]+>")
 
 
 class EmailProviderError(Exception):
@@ -157,41 +185,18 @@ class EmailMaster(ABC):
         """
         return uuid.uuid4().hex[:8]
 
-    def build_dynamic_email(self, user_name: str, conv_id: str) -> str:
-        """Construct the dynamic email address for a conversation.
-
-        Converts the user's display name to CamelCase (e.g.
-        ``"James Whitfield"`` → ``"JamesWhitfield"``) and combines it with the
-        conversation/thread id via a dot so the address is human-readable
-        and the conv_id can be recovered from any reply that arrives there.
-        Uses this instance's own :attr:`outbound_domain` — the provider
-        selected for this particular send (see
-        :mod:`src.services.conversation_service`).
-
-        Args:
-            user_name (str): The user's display name (e.g. ``"James Whitfield"``).
-            conv_id (str): The 8-character conversation identifier returned
-                by :meth:`generate_conversation_id`.
-
-        Returns:
-            str: Fully qualified address, e.g.
-                ``"JamesWhitfield.3fa9c1b2@mail.jobsetu.online"``.
-
-        Example:
-            >>> provider.build_dynamic_email("James Whitfield", "3fa9c1b2")
-            'JamesWhitfield.3fa9c1b2@mail.jobsetu.online'
-        """
-        camel = "".join(word.capitalize() for word in user_name.split())
-        return f"{camel}.{conv_id}@{self.outbound_domain}"
-
     def build_sending_email(self, user_name: str) -> str:
         """Construct this provider's stable per-user ``From`` address.
 
-        Same CamelCase conversion as :meth:`build_dynamic_email` but with no
-        conv_id suffix, since this identifies the sending user rather than
-        one conversation. Rebuilt fresh for whichever provider is selected
-        at send time, so the domain always matches a domain that provider
-        is actually authorised to send from.
+        Converts the user's display name to CamelCase (e.g.
+        ``"James Whitfield"`` → ``"JamesWhitfield"``) on this provider's own
+        outbound domain. Rebuilt fresh for whichever provider is selected at
+        send time, so the domain always matches a domain that provider is
+        actually authorised to send from.
+
+        Providers that can only send as one fixed, pre-authenticated mailbox
+        override this — see
+        :meth:`~src.email_platform.alibaba_provider.AlibabaEnterpriseProvider.build_sending_email`.
 
         Args:
             user_name (str): The user's display name (e.g. ``"James Whitfield"``).
@@ -207,85 +212,88 @@ class EmailMaster(ABC):
         camel = "".join(word.capitalize() for word in user_name.split())
         return f"{camel}@{self.outbound_domain}"
 
-    def parse_dynamic_email(self, email_address: str) -> dict | None:
-        """Extract ``conv_id`` from a dynamic address.
+    # ── Threading identity: Message-ID + subject token ───────────────
 
-        Supports three address formats:
+    def build_message_id(self, conv_id: str) -> str:
+        """Mint the RFC 5322 ``Message-ID`` this app puts on the wire.
 
-        * **Current**: ``{CamelCaseName}.{conv_id}@{this provider's outbound_domain}``
-          e.g. ``JamesWhitfield.3fa9c1b2@mail.jobsetu.online``
-        * **Legacy** (backward-compat): ``{CamelCaseName}-{conv_id}@{this provider's outbound_domain}``
-          e.g. ``JamesWhitfield-3fa9c1b2@mail.jobsetu.online``
-        * **Legacy** (backward-compat): ``{prefix}_conv{conv_id}@{this provider's outbound_domain}``
-          e.g. ``james.whitfield_conv3fa9c1b2@mail.jobsetu.online``
+        Minting our own id *before* the send is the only way the inbound
+        ``In-Reply-To``/``References`` lookup can hit our own database — a
+        provider-generated id is never reported back in a form we could store
+        against the outgoing message. Embedding ``conv_id`` in the local part
+        also makes the id self-describing when reading raw headers by hand.
 
         Args:
-            email_address (str): The raw ``To`` address from an inbound
-                email.
+            conv_id (str): The conversation this message belongs to.
 
         Returns:
-            dict | None: ``{"conv_id": str}`` on success, or ``None`` when
-                the address does not match any known pattern (or when this
-                provider's ``{PROVIDER}_OUTBOUND_DOMAIN`` is not
-                configured).
+            str: An angle-bracketed id, e.g.
+                ``"<rfq.hd273hsd.9f1c….@imsflow.online>"``.
 
         Example:
-            >>> provider.parse_dynamic_email(
-            ...     "JamesWhitfield.3fa9c1b2@mail.jobsetu.online")
-            {'conv_id': '3fa9c1b2'}
-            >>> provider.parse_dynamic_email("nobody@other.com") is None
+            >>> provider.build_message_id("hd273hsd")   # doctest: +SKIP
+            '<rfq.hd273hsd.4e1f…@imsflow.online>'
+        """
+        domain = (
+            self.settings.message_id_domain
+            or self.outbound_domain
+            or "local"
+        ).lstrip("@")
+        return f"<rfq.{conv_id}.{uuid.uuid4().hex}@{domain}>"
+
+    @staticmethod
+    def parse_message_ids(*header_values: str) -> list[str]:
+        """Split ``In-Reply-To`` / ``References`` into individual ids.
+
+        ``References`` is ordered oldest→newest, so each header's ids are
+        reversed to put the most recent reference first: when a long thread
+        offers several candidates, the newest one is the right conversation
+        to bind to.
+
+        Args:
+            *header_values (str): Raw header values, in priority order (pass
+                ``In-Reply-To`` before ``References``).
+
+        Returns:
+            list[str]: De-duplicated ``"<id@host>"`` tokens, most recent
+                first, preserving the order they were found in.
+
+        Example:
+            >>> EmailMaster.parse_message_ids("", "<a@x> <b@x>")
+            ['<b@x>', '<a@x>']
+        """
+        ids: list[str] = []
+        for value in header_values:
+            ids.extend(reversed(_MESSAGE_ID_RE.findall(value or "")))
+        # dict.fromkeys de-dupes while preserving first-seen order.
+        return list(dict.fromkeys(ids))
+
+    @staticmethod
+    def parse_conv_id_from_subject(subject: str) -> str | None:
+        """Extract ``"hd273hsd"`` from any subject carrying the RFQ prefix.
+
+        This is the *guaranteed* fallback in the matching chain: some API
+        gateways rewrite ``Message-ID`` and most clients drop custom headers
+        on reply, but the subject prefix survives everything short of the
+        supplier retyping the subject by hand.
+
+        Args:
+            subject (str): The inbound subject line, with or without
+                ``Re:``/``Fwd:``/``回复:`` style prefixes.
+
+        Returns:
+            str | None: The lowercased conversation id, or ``None`` when the
+                subject carries no RFQ prefix.
+
+        Example:
+            >>> EmailMaster.parse_conv_id_from_subject(
+            ...     "Re: [RFQ - HD273HSD] - Request for Quotation")
+            'hd273hsd'
+            >>> EmailMaster.parse_conv_id_from_subject("Hello") is None
             True
         """
-        if not self.outbound_domain:
-            self.log.error(
-                "%s_OUTBOUND_DOMAIN is not set; cannot match inbound address",
-                self.provider_name.upper(),
-            )
-            return None
-
-        domain = re.escape(self.outbound_domain)
-        patterns = [
-            # Current format: CamelCaseName.{8hex}@domain
-            rf"[A-Za-z0-9]+\.([a-f0-9]{{8}})@{domain}(?![\w.-])",
-            # Legacy format: CamelCaseName-{8hex}@domain
-            rf"[A-Za-z0-9]+-([a-f0-9]{{8}})@{domain}(?![\w.-])",
-            # Legacy format: any_prefix_conv{8hex}@domain
-            rf"[a-z0-9._-]+_conv([a-f0-9]{{8}})@{domain}(?![\w.-])",
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, email_address or "", re.IGNORECASE)
-            if match:
-                return {"conv_id": match.group(1)}
-        return None
-
-    def parse_conv_id_from_body(self, *texts: str) -> dict | None:
-        """Recover ``conv_id`` from the quoted RFQ reference footer.
-
-        Some mail clients mangle the dynamic ``To`` address when a supplier
-        forwards an RFQ instead of replying to it directly (autocomplete or
-        an address-book entry can drop the ``.{conv_id}`` suffix entirely).
-        When that happens the quoted original message is still present in
-        the body, including the ``Reference: CONV-{conv_id}`` footer written
-        by :meth:`build_rfq_html`, so it is used as a fallback match.
-
-        Args:
-            *texts (str): Candidate bodies to search, e.g. ``body_text`` and
-                ``body_html`` — the first match wins.
-
-        Returns:
-            dict | None: ``{"conv_id": str}`` (lowercase) on success, or
-                ``None`` if no candidate contains the footer reference.
-
-        Example:
-            >>> provider.parse_conv_id_from_body(
-            ...     "On Mon, ... Reference: CONV-3FA9C1B2 | USR-42")
-            {'conv_id': '3fa9c1b2'}
-        """
-        for text in texts:
-            match = re.search(r"CONV-([A-Fa-f0-9]{8})\b", text or "")
-            if match:
-                return {"conv_id": match.group(1).lower()}
-        return None
+        match = SUBJECT_PREFIX_RE.search(subject or "")
+        return match.group(1).lower() if match else None
 
     @staticmethod
     def extract_email_address(raw: str) -> str:
@@ -311,107 +319,93 @@ class EmailMaster(ABC):
 
     # ── Shared RFQ rendering ─────────────────────────────────────────
 
-    def build_rfq_subject(self, conv_id: str, product_name: str) -> str:
-        """Build the standard RFQ subject line.
+    def build_rfq_subject(self, conv_id: str, subject_line: str) -> str:
+        """Prefix a subject line with the conversation's RFQ token.
+
+        Requirement 2: every outbound RFQ subject is exactly
+        ``[RFQ - {conv_id}] - {subject line}``. The token is the whole
+        conversation id (not a truncated tag), because
+        :meth:`parse_conv_id_from_subject` looks it up directly in
+        ``conversations.token`` when a reply arrives with no usable headers.
 
         Args:
-            conv_id (str): The conversation identifier; its first four
-                characters become a short, human-friendly reference tag.
-            product_name (str): The product being quoted.
+            conv_id (str): The conversation identifier.
+            subject_line (str): The human-readable subject, e.g.
+                ``"Request for Quotation — Speaker X200"``.
 
         Returns:
-            str: A subject line such as
-                ``"[RFQ-3FA9] Request for Quotation — Speaker X200"``.
+            str: The prefixed subject line.
 
         Example:
-            >>> provider.build_rfq_subject("3fa9c1b2", "Speaker X200")
-            '[RFQ-3FA9] Request for Quotation — Speaker X200'
+            >>> provider.build_rfq_subject("hd273hsd", "Request for Quotation")
+            '[RFQ - hd273hsd] - Request for Quotation'
         """
-        tag = conv_id[:4].upper()
-        return (
-            f"[RFQ-{tag}] Request for Quotation — {product_name}"
-        )
+        return f"[RFQ - {conv_id}] - {subject_line}"
 
     def build_rfq_html(
         self,
         *,
-        user_id: str,
         conv_id: str,
         supplier_name: str,
         product_name: str,
-        quantity: int,
+        quantity,
         target_price: str,
+        supplier_type: str = "non_chinese",
     ) -> str:
         """Render the HTML body of an RFQ email.
 
-        The markup is intentionally inline-styled so it renders consistently
-        across email clients, which strip ``<style>`` blocks.
+        Thin delegation to the shared
+        :class:`~src.email_platform.rfq_renderer.RfqRenderer` so provider
+        code and the service layer keep one call site while the markup itself
+        lives in a Jinja template. HTML only — no ``text/plain`` alternative
+        is produced anywhere (requirement 8).
 
         Args:
-            user_id (str): The owning user (shown in the footer reference).
-            conv_id (str): The conversation identifier (shown in the footer).
+            conv_id (str): The conversation identifier (shown as the
+                reference footer).
             supplier_name (str): Salutation name for the supplier.
             product_name (str): Product being quoted.
-            quantity (int): Number of units requested.
+            quantity: Number of units requested.
             target_price (str): Buyer's target unit price, e.g. ``"$12.00"``.
+            supplier_type (str): ``"chinese"`` selects the Simplified-Chinese
+                template; anything else uses the English one.
 
         Returns:
-            str: A complete HTML fragment ready to use as the email body.
+            str: A complete HTML document ready to use as the email body.
 
         Example:
-            >>> html = provider.build_rfq_html(
-            ...     user_id="42", conv_id="3fa9c1b2",
-            ...     supplier_name="Acme", product_name="X200",
-            ...     quantity=500, target_price="$12.00")
-            >>> "Request for Quotation" not in html  # subject, not body
-            True
-            >>> "Acme" in html
+            >>> html = provider.build_rfq_html(     # doctest: +SKIP
+            ...     conv_id="hd273hsd", supplier_name="Acme",
+            ...     product_name="X200", quantity=500,
+            ...     target_price="$12.00")
+            >>> "Acme" in html                      # doctest: +SKIP
             True
         """
-        company = self.company_name
-        # Built as a list of short lines so no single source line exceeds
-        # the 79-column limit; ``"".join`` reassembles the final markup.
-        # Small base64-encoded blue banner (320×40 PNG) for image-tracking
-        # tests — demonstrates inline image rendering across email clients.
-        parts = [
-            '<div style="font-family: Arial, sans-serif; '
-            'max-width: 600px;">',
-            # Company banner image (inline base64 — renders without external
-            # host; tests that images in email body are tracked correctly)
-            f'<img src="https://placehold.co/320x40/blue/white?text={company}" '
-            f'alt="{company}" width="320" height="40" '
-            'style="display:block; margin-bottom:16px;">',
-            f"<p>Dear {supplier_name},</p>",
-            "<p>I am writing to request a formal quotation for the "
-            "following:</p>",
-            '<table border="1" cellpadding="8" cellspacing="0"',
-            ' style="border-collapse: collapse; width: 100%;">',
-            '<tr style="background-color: #f5f5f5;">',
-            "<th>Product</th><th>Quantity</th><th>Target Price</th></tr>",
-            f"<tr><td>{product_name}</td>",
-            f"<td>{quantity} units</td>",
-            f"<td>{target_price} per unit</td></tr>",
-            "</table>",
-            "<p>Please include the following in your quotation:</p>",
-            "<ul>",
-            "<li>Unit price at stated quantity (FOB)</li>",
-            "<li>Minimum order quantity (MOQ)</li>",
-            "<li>Lead time and production capacity</li>",
-            "<li>Payment terms</li>",
-            "<li>Product specifications and certifications</li>",
-            "</ul>",
-            "<p>We look forward to your response within 3 business "
-            "days.</p>",
-            f"<p>Best regards,<br><strong>{company} Sourcing Team"
-            "</strong></p>",
-            '<hr style="border:none; border-top:1px solid #eee; '
-            'margin-top:30px;">',
-            '<p style="font-size:11px; color:#aaa;">',
-            f"Reference: CONV-{conv_id.upper()} | USR-{user_id} "
-            f"| THREAD-{conv_id.upper()}</p>",
-            "</div>",
-        ]
-        return "".join(parts)
+        return self.rfq_renderer.render(
+            supplier_type=supplier_type,
+            company=self.company_name,
+            conv_id=conv_id,
+            supplier_name=supplier_name,
+            product_name=product_name,
+            quantity=quantity,
+            target_price=target_price,
+        )
+
+    @property
+    def rfq_renderer(self) -> RfqRenderer:
+        """Return this instance's lazily-built RFQ body renderer.
+
+        Built on first use rather than in ``__init__`` so subclasses that
+        deliberately skip ``super().__init__`` (the region-pinned variants —
+        see :class:`~src.email_platform.sendcloud_provider.SendCloudHKEmailProvider`)
+        do not each have to remember to construct one.
+
+        Returns:
+            RfqRenderer: The cached renderer for this provider instance.
+        """
+        if getattr(self, "_rfq_renderer", None) is None:
+            self._rfq_renderer = RfqRenderer(self.settings)
+        return self._rfq_renderer
 
     # ── Provider-specific transmission (must be overridden) ──────────
 
@@ -425,7 +419,8 @@ class EmailMaster(ABC):
         to_name: str,
         subject: str,
         html_body: str,
-        reply_to: str,
+        message_id: str,
+        extra_headers: dict[str, str] | None = None,
         attachments: list | None = None,
     ) -> dict:
         """Transmit a single email through the concrete provider.
@@ -434,24 +429,35 @@ class EmailMaster(ABC):
         normalise the result so callers never depend on a provider's native
         response shape.
 
+        Every implementation must put ``message_id`` on the wire as the RFC
+        ``Message-ID`` header (SMTP sets it directly; API providers pass it
+        through their custom-header field) and must send an HTML body only —
+        no ``text/plain`` alternative. **No implementation sets a
+        ``Reply-To`` header**: replies are threaded by ``Message-ID`` and the
+        subject token, not by a per-conversation address.
+
         Args:
             from_email (str): Verified sender address for the ``From``
                 header.
             from_name (str): Display name for the ``From`` header.
             to_email (str): Recipient address.
             to_name (str): Recipient display name.
-            subject (str): Subject line.
+            subject (str): Subject line, already carrying the
+                ``[RFQ - {conv_id}]`` prefix.
             html_body (str): HTML body of the message.
-            reply_to (str): ``Reply-To`` address — the dynamic conversation
-                address so replies route back correctly.
+            message_id (str): The RFC 5322 ``Message-ID`` this app minted for
+                the message (see :meth:`build_message_id`).
+            extra_headers (dict[str, str] | None): Additional headers to set,
+                e.g. ``{"X-RFQ-Conversation-Id": conv_id}``.
             attachments (list | None): Optional list of attachment dicts,
                 each with keys ``filename`` (str), ``content`` (bytes) and
                 ``content_type`` (str).
 
         Returns:
             dict: Normalised result with keys ``status_code`` (int),
-                ``provider`` (str) and ``provider_message_id``
-                (str | None).
+                ``provider`` (str), ``provider_message_id`` (str | None) and
+                ``message_id`` (str) — the last echoing back what actually
+                went out, so the caller persists the real header value.
 
         Raises:
             ProviderConfigError: If required credentials are missing.

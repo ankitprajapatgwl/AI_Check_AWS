@@ -17,10 +17,14 @@ Field          Meaning
 ``spam_score`` SpamAssassin score (string)
 ``SPF``        SPF result
 ``dkim``       DKIM result
+``headers``    Raw header block of the original message
 ``attachments`` Number of attachments (string integer)
 ``attachment-info`` JSON map of per-attachment metadata
 ``attachment1``..``attachmentN`` Uploaded files
 ============== ==================================================
+
+``headers`` is what carries ``Message-ID``/``In-Reply-To``/``References``,
+so it is parsed as a headers-only MIME message to drive inbound threading.
 
 Example:
     >>> from src.webhook_factory.sendgrid_webhook import (
@@ -29,7 +33,9 @@ Example:
     >>> inbound = await parser.parse(request)             # doctest: +SKIP
 """
 
+import email
 import json
+from email.policy import default
 
 from fastapi import Request
 
@@ -97,6 +103,16 @@ class SendGridWebhookParser(WebhookParserMaster):
         except (TypeError, ValueError):
             spam_score = 0.0
 
+        # Inbound Parse posts the original header block verbatim in a
+        # ``headers`` field — parsing it as a headers-only MIME message is
+        # the simplest way to get Message-ID/In-Reply-To/References back.
+        raw_headers = form.get("headers", "") or ""
+        headers = self.headers_from_mime(
+            email.message_from_string(raw_headers, policy=default)
+            if raw_headers
+            else None
+        )
+
         inbound = InboundEmail(
             from_email=form.get("from", ""),
             to_email=form.get("to", ""),
@@ -107,14 +123,21 @@ class SendGridWebhookParser(WebhookParserMaster):
             dkim=form.get("dkim", ""),
             spf=form.get("SPF", ""),
             provider=self.provider_name,
+            message_id=headers.get("message-id", ""),
+            in_reply_to=headers.get("in-reply-to", ""),
+            references=headers.get("references", ""),
+            headers=headers,
+            raw_message=raw_headers,
         )
 
         inbound.attachments = await self._extract_attachments(form)
         self.log.info(
-            "Parsed SendGrid inbound: %s -> %s (%d attachment(s))",
+            "Parsed SendGrid inbound: %s -> %s (%d attachment(s), "
+            "message_id=%s)",
             inbound.from_email,
             inbound.to_email,
             len(inbound.attachments),
+            inbound.message_id or "-",
         )
         return inbound
 

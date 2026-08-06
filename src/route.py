@@ -12,18 +12,20 @@ inbound webhook, which providers call anonymously.
 
 Routes:
 
-================ ====== ==============================================
-Method + path           Purpose
-================ ====== ==============================================
-``GET /``               Redirect to ``/tracking``.
-``GET /send``           Render the Send RFQ form.
-``POST /send``          Create a conversation and send the RFQ.
-``GET /tracking``       Personal dashboard: my stats + my conversations.
-``GET /tracking/{c}``   Full conversation thread (ownership-checked).
-``POST /tracking/{c}/delete`` Delete one of my conversations.
-``POST /webhooks/inbound`` Receive an inbound reply (any provider).
-``GET /webhooks/inbound``  Validation probe (Elastic Email GETs this).
-================ ====== ==============================================
+=============================== ==============================================
+Method + path                   Purpose
+=============================== ==============================================
+``GET /``                       Redirect to ``/tracking``.
+``GET /send``                   Render the Send RFQ form.
+``POST /draft``                 Mint a conv_id + draft row, return its subject.
+``POST /send``                  Send the RFQ (drafting first if needed).
+``GET /tracking``               Personal dashboard: my stats + conversations.
+``GET /tracking/{c}``           Full conversation thread (ownership-checked).
+``POST /tracking/{c}/delete``   Delete one of my conversations.
+``POST /webhooks/inbound/{p}``  Receive an inbound reply from provider ``p``.
+``GET /webhooks/inbound/{p}``   Validation probe (Elastic Email GETs this).
+``POST|GET /webhooks/inbound``  Legacy aliases for the default provider.
+=============================== ==============================================
 
 Example:
     >>> from src.route import router
@@ -41,7 +43,6 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from src.auth.dependencies import require_login
 from src.config import BASE_PATH
 from src.email_platform.email_master import EmailProviderError
-from src.email_platform.factory import EmailProviderFactory
 from src.services.conversation_service import ConversationService
 
 # A single router that :mod:`src.app` includes on the FastAPI application.
@@ -55,22 +56,26 @@ _PROVIDER_LABELS = {
     "sendgrid": "SendGrid",
     "mailgun": "Mailgun",
     "elasticemail": "Elastic Email",
+    "alibaba": "Alibaba Enterprise",
 }
 
-# Provider keys offered on the Send RFQ form's "Provider" dropdown, in
-# display order.
-_FORM_PROVIDERS = ["sendcloud", "engagelab"]
+# Provider keys offered on the Send RFQ form's "Provider" dropdown and as
+# Quick Send cards, in display order.
+_FORM_PROVIDERS = ["sendcloud", "engagelab", "alibaba"]
 
 _SUPPLIER_TYPE_LABELS = {"chinese": "Chinese", "non_chinese": "Non-Chinese"}
 
 # Which supplier types each provider on the form can actually be used for,
 # and which internal factory key (see src/email_platform/factory.py) that
-# combination resolves to. SendCloud and EngageLab both reach Chinese *and*
-# non-Chinese recipients, but through different, region-locked base
-# URLs/credentials (setup_docs/aurora_send_cloud/AuroraSendCloud_Documentation.md
-# §2: Hong Kong/CN for Chinese mailboxes, Singapore for everyone else — so
-# "sendcloud" + Chinese resolves to the separate "sendcloud_hk" factory key).
-# EngageLab's two data centers (Singapore/Turkey, per
+# combination resolves to.
+#
+# SendCloud and Alibaba both reach Chinese *and* non-Chinese recipients, but
+# through different regions: SendCloud's Hong Kong/CN vs Singapore base URLs
+# are region-locked to separate credentials
+# (setup_docs/aurora_send_cloud/AuroraSendCloud_Documentation.md §2), and
+# Alibaba's Hong Kong SMTP host sits closer to Chinese mailboxes than its
+# Singapore one — so "+ chinese" resolves to the separate "_hk" factory key
+# for both. EngageLab's two data centers (Singapore/Turkey, per
 # setup_docs/engagelab_guide/Engagelab_Documentation.md §2) aren't documented
 # as a China-vs-non-China split, so it sends through the same Singapore
 # endpoint for both supplier types. SendGrid has no regional split and is
@@ -81,49 +86,120 @@ _SEND_KEYS = {
     ("engagelab", "chinese"): "engagelab",
     ("engagelab", "non_chinese"): "engagelab",
     ("sendgrid", "non_chinese"): "sendgrid",
+    ("alibaba", "chinese"): "alibaba_hk",
+    ("alibaba", "non_chinese"): "alibaba",
 }
+
+# Which region each (provider, supplier type) pair actually sends through,
+# shown as a hint on the Quick Send cards so a tester knows what they're
+# exercising without reading _SEND_KEYS.
+_SEND_KEY_HINTS = {
+    "sendcloud": "Hong Kong/CN region",
+    "sendcloud_hk": "Hong Kong/CN region",
+    "engagelab": "Singapore region",
+    "sendgrid": "Global",
+    "alibaba": "Singapore SMTP",
+    "alibaba_hk": "Hong Kong SMTP",
+}
+
+# Which parser the legacy un-suffixed /webhooks/inbound path uses. Kept so
+# provider dashboards configured before the per-provider routes existed keep
+# delivering; new configurations should point at
+# /webhooks/inbound/{provider}.
+_DEFAULT_INBOUND_PROVIDER = "engagelab"
+
+
+def _resolve_send_key(provider_name: str, supplier_type: str) -> str:
+    """Validate a provider/supplier-type pair and resolve its factory key.
+
+    Shared by ``POST /draft`` and ``POST /send`` so both reject the same
+    combinations with the same messages.
+
+    Args:
+        provider_name (str): The user-facing provider key from the form.
+        supplier_type (str): ``"chinese"`` or ``"non_chinese"``.
+
+    Returns:
+        str: The resolved factory key, e.g. ``"alibaba_hk"``.
+
+    Raises:
+        EmailProviderError: If either value is missing/unknown, or the pair
+            is one the provider doesn't support.
+    """
+    key = (provider_name or "").strip().lower()
+    stype = (supplier_type or "").strip().lower()
+    if not key:
+        raise EmailProviderError("Please select an email provider.")
+    if stype not in _SUPPLIER_TYPE_LABELS:
+        raise EmailProviderError("Please select a supplier type.")
+    if key not in _PROVIDER_LABELS:
+        raise EmailProviderError(f"Unknown email provider '{provider_name}'.")
+
+    send_key = _SEND_KEYS.get((key, stype))
+    if send_key is None:
+        raise EmailProviderError(
+            f"{_PROVIDER_LABELS.get(key, key)} doesn't support "
+            f"{_SUPPLIER_TYPE_LABELS[stype]} suppliers. Pick a provider "
+            "that supports this supplier type."
+        )
+    return send_key
 
 
 def _available_providers(settings) -> list[dict]:
-    """List the providers offered on the Send RFQ form's "Provider" dropdown.
+    """List the providers offered on the Send RFQ form and Quick Send.
 
     Args:
         settings: The application :class:`~src.config.Settings`.
 
     Returns:
-        list[dict]: One ``{"key", "label", "outbound_domain", "supported_types"}``
-            per provider in :data:`_FORM_PROVIDERS`. ``outbound_domain``
-            drives the live "From"/"Reply address" preview on the form;
-            ``supported_types`` lets the client warn on a provider/supplier-type
-            combination the server would reject (the server re-validates
-            regardless — see :func:`send_email_form`). A provider whose
-            domain isn't configured yet just shows an empty preview (the
-            send itself still fails fast with a clear error — see
-            :meth:`~src.services.conversation_service.ConversationService.get_provider`).
+        list[dict]: One entry per provider in :data:`_FORM_PROVIDERS` with
+            ``key``, ``label``, ``outbound_domain``, ``supported_types``,
+            ``from_address_preview`` and ``region_hints``.
+            ``from_address_preview`` drives the live "From" preview on the
+            form — Alibaba shows its single authenticated mailbox, everyone
+            else the ``{CamelName}@{domain}`` pattern. ``supported_types``
+            lets the client warn on a combination the server would reject
+            (the server re-validates regardless — see
+            :func:`_resolve_send_key`). A provider whose domain isn't
+            configured yet just shows an empty preview; the send itself still
+            fails fast with a clear error.
     """
-    return [
-        {
+    providers = []
+    for key in _FORM_PROVIDERS:
+        supported = [stype for (pkey, stype) in _SEND_KEYS if pkey == key]
+        providers.append({
             "key": key,
             "label": _PROVIDER_LABELS.get(key, key.capitalize()),
             "outbound_domain": settings.provider_outbound_domain(key),
-            "supported_types": [
-                stype for (pkey, stype) in _SEND_KEYS if pkey == key
-            ],
-        }
-        for key in _FORM_PROVIDERS
-    ]
+            "supported_types": supported,
+            # Alibaba SMTP only accepts its authenticated mailbox as From, so
+            # its preview is a fixed address rather than a per-user pattern.
+            "from_address_preview": (
+                settings.alibaba_mail_address or ""
+                if key == "alibaba"
+                else ""
+            ),
+            "region_hints": {
+                stype: _SEND_KEY_HINTS.get(
+                    _SEND_KEYS[(key, stype)], _SEND_KEYS[(key, stype)]
+                )
+                for stype in supported
+            },
+        })
+    return providers
 
 
-# Maps ConversationService.handle_inbound's "status" field to an HTTP
-# status code. "matched"/"unmatched"/"skipped" are all valid, non-retryable
-# outcomes (a spam email or an address that doesn't match a conversation is
-# not a delivery failure), so they stay 200 — a non-2xx would make most
-# providers retry the same POST. "rejected" (bad signature) and "error"
-# (unparseable payload) are genuine failures and get a non-2xx status.
+# Maps ConversationService's inbound "status" field to an HTTP status code.
+# "matched"/"unmatched"/"skipped"/"duplicate" are all valid, non-retryable
+# outcomes (a spam email, an unrecognised sender, or a redelivery is not a
+# delivery failure), so they stay 200 — a non-2xx would make most providers
+# retry the same POST. "rejected" (bad signature) and "error" (unparseable
+# payload) are genuine failures and get a non-2xx status.
 _INBOUND_STATUS_CODES = {
     "matched": 200,
     "unmatched": 200,
     "skipped": 200,
+    "duplicate": 200,
     "rejected": 400,
     "error": 500,
 }
@@ -146,13 +222,15 @@ async def quick_send_page(
     """Render the Quick Test Send page.
 
     A one-click testing surface: one card per provider in
-    :data:`_FORM_PROVIDERS` (SendCloud, EngageLab), each split into a
-    Chinese and a Non-Chinese section. Every section only asks for the
-    destination email — the rest of the RFQ payload (supplier name,
-    product, quantity, target price) is filled in with fixed defaults
-    client-side (see ``templates/quick_send.html``), which then posts to
-    the same ``POST /send`` this module already exposes. On a successful
-    send the page opens the resulting conversation's tracking page
+    :data:`_FORM_PROVIDERS` (SendCloud, EngageLab, Alibaba Enterprise), each
+    split into a Chinese and a Non-Chinese section that names the region it
+    resolves to. Every section only asks for the destination email — the
+    rest of the RFQ payload (supplier name, product, quantity, target price)
+    is filled in with fixed defaults client-side (see
+    ``templates/quick_send.html``), which then posts to the same
+    ``POST /send`` this module already exposes, so Quick Send exercises the
+    identical draft-then-send path as the full form. On a successful send the
+    page opens the resulting conversation's tracking page
     (``/tracking/{conv_id}``) in a new tab.
 
     Args:
@@ -187,16 +265,15 @@ async def send_email_page(
     Displays the HTML form for composing a new RFQ. Optional query
     parameters let the page surface success/error feedback after a
     POST/redirect cycle. The form has a required "Provider" dropdown
-    (SendCloud / EngageLab / SendGrid, default empty) and the Supplier
-    Details section has a required "Supplier Type" dropdown (Chinese /
-    Non-Chinese, default empty). SendCloud and EngageLab both reach
-    Chinese and Non-Chinese suppliers, through different region-locked
-    URLs/credentials for SendCloud (Hong Kong/CN vs Singapore) and the
-    same Singapore endpoint either way for EngageLab; SendGrid only
-    supports Non-Chinese. :func:`send_email_form` resolves the
-    provider+supplier-type pair to the actual sending region server-side
-    (see :data:`_SEND_KEYS`) and rejects any combination a provider doesn't
-    support.
+    (SendCloud / EngageLab / Alibaba Enterprise, default empty) and the
+    Supplier Details section has a required "Supplier Type" dropdown
+    (Chinese / Non-Chinese, default empty). All three reach both supplier
+    types; SendCloud and Alibaba route Chinese suppliers through their Hong
+    Kong region and everyone else through Singapore, while EngageLab uses
+    the same Singapore endpoint either way. :func:`_resolve_send_key`
+    resolves the provider+supplier-type pair to the actual sending region
+    server-side (see :data:`_SEND_KEYS`) and rejects any combination a
+    provider doesn't support.
 
     Args:
         request (Request): FastAPI request (required by Jinja2).
@@ -226,9 +303,77 @@ async def send_email_page(
     )
 
 
+@router.post("/draft")
+async def create_draft(
+    request: Request,
+    supplier_email: str = Form(...),
+    supplier_name: str = Form(default=""),
+    supplier_type: str = Form(...),
+    provider_name: str = Form(...),
+    product_name: str = Form(default=""),
+    quantity: str = Form(default=""),
+    target_price: str = Form(default=""),
+    project_id: str = Form(default=""),
+    project_name: str = Form(default=""),
+    current_user: dict = Depends(require_login),
+) -> JSONResponse:
+    """Mint a conversation id and persist it as a draft (requirements 1+2).
+
+    Called by the Send RFQ form before submitting, so the page can show the
+    real reference and the exact subject that will go out. Nothing is sent
+    here — the conversation lands in ``status='draft'``.
+
+    Args:
+        request (Request): FastAPI request.
+        supplier_email (str): Supplier's email address.
+        supplier_name (str): Supplier's display name.
+        supplier_type (str): ``"chinese"`` or ``"non_chinese"``.
+        provider_name (str): Provider key selected on the form.
+        product_name (str): Product being quoted.
+        quantity (str): Requested quantity in units.
+        target_price (str): Target unit price, e.g. ``"$12.00"``.
+        project_id (str): UUID of the selected catalog product, if any.
+        project_name (str): That product's name.
+        current_user (dict): The logged-in user (conversation owner).
+
+    Returns:
+        JSONResponse: ``{"conv_id": ..., "subject": "[RFQ - hd273hsd] - ..."}``
+            on success, or ``{"error": ...}`` with ``400`` when the
+            provider/supplier-type pair is invalid.
+    """
+    service: ConversationService = request.app.state.service
+    log = request.app.state.log
+    try:
+        send_key = _resolve_send_key(provider_name, supplier_type)
+        conversation = await service.create_draft(
+            user_id=current_user["id"],
+            supplier_email=supplier_email,
+            supplier_name=supplier_name,
+            supplier_type=supplier_type.strip().lower(),
+            product_name=product_name,
+            quantity=quantity or None,
+            target_price=target_price,
+            project_id=project_id,
+            project_name=project_name,
+            provider_name=provider_name.strip().lower(),
+            send_key=send_key,
+        )
+        return JSONResponse({
+            "conv_id": conversation["conv_id"],
+            "subject": conversation["subject"],
+        })
+    except EmailProviderError as exc:
+        log.error("Draft failed: %s", exc)
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except Exception as exc:  # noqa: BLE001 - last-resort safety net
+        log.exception("Unexpected error while creating a draft")
+        return JSONResponse({"error": str(exc)[:300]}, status_code=500)
+
+
 @router.post("/send")
 async def send_email_form(
     request: Request,
+    conv_id: str = Form(default=""),
     project_id: str = Form(default=""),
     project_name: str = Form(default=""),
     provider_name: str = Form(default=""),
@@ -241,33 +386,34 @@ async def send_email_form(
     attachments: List[UploadFile] = File(default=[]),
     current_user: dict = Depends(require_login),
 ):
-    """Process the RFQ form submission and send the email.
+    """Send an RFQ, drafting the conversation first if one wasn't made yet.
 
-    Creates a conversation, dispatches the RFQ through the provider chosen
-    on the form's required "Provider" dropdown — routed to the region that
-    matches the required "Supplier Type" dropdown when the provider has
-    one (SendCloud: Hong Kong/CN for Chinese, Singapore for Non-Chinese;
-    see :data:`_SEND_KEYS`) — persists everything and redirects to the
-    conversation detail page on success. A provider/supplier-type
-    combination the provider doesn't support at all (e.g. SendGrid with
-    Chinese) is rejected. Provider/configuration failures (including an
-    empty selection or an unsupported combination, in case the browser's
-    own ``required`` validation is bypassed) are caught and surfaced to the
-    user as a banner rather than a 500 page. The sender is always the
-    logged-in user — there is no user picker anymore (requirement 5).
+    Requirement 1's draft-then-send ordering always holds: if the form
+    already created a draft (``conv_id`` present, owned by this user and
+    still in ``draft``) it is reused, and otherwise one is created inline
+    before sending. That keeps Quick Send — and a browser with JavaScript
+    disabled — on exactly the same path as the full form.
+
+    The RFQ goes out through the provider chosen on the required "Provider"
+    dropdown, routed to the region matching the required "Supplier Type"
+    (SendCloud/Alibaba: Hong Kong for Chinese, Singapore for Non-Chinese;
+    see :data:`_SEND_KEYS`). An unsupported combination is rejected, as is
+    an empty selection, in case the browser's own ``required`` validation
+    was bypassed. Provider failures leave the conversation ``failed`` and
+    are surfaced as a banner rather than a 500 page. The sender is always
+    the logged-in user.
 
     Args:
         request (Request): FastAPI request.
-        provider_name (str): Provider key selected on the form, e.g.
-            ``"engagelab"`` — required, no default selection.
-        supplier_type (str): ``"chinese"`` or ``"non_chinese"``, selected
-            on the form — required, no default selection; must be one
-            ``provider_name`` actually supports (see :data:`_SEND_KEYS`).
+        conv_id (str): Optional draft to send; created inline when absent.
+        provider_name (str): Provider key selected on the form.
+        supplier_type (str): ``"chinese"`` or ``"non_chinese"``.
         supplier_email (str): Supplier's email address.
         supplier_name (str): Supplier's display name.
         product_name (str): Name of the product being quoted.
         quantity (int): Requested quantity in units.
         target_price (str): Target unit price string, e.g. ``"$12.00"``.
+        attachments (List[UploadFile]): Files to attach.
         current_user (dict): The logged-in user (sender identity).
 
     Returns:
@@ -277,22 +423,8 @@ async def send_email_form(
     service: ConversationService = request.app.state.service
     log = request.app.state.log
     try:
-        key = provider_name.strip().lower()
+        send_key = _resolve_send_key(provider_name, supplier_type)
         stype = supplier_type.strip().lower()
-        if not key:
-            raise EmailProviderError("Please select an email provider.")
-        if stype not in _SUPPLIER_TYPE_LABELS:
-            raise EmailProviderError("Please select a supplier type.")
-        if key not in _PROVIDER_LABELS:
-            raise EmailProviderError(f"Unknown email provider '{provider_name}'.")
-        send_key = _SEND_KEYS.get((key, stype))
-        if send_key is None:
-            raise EmailProviderError(
-                f"{_PROVIDER_LABELS.get(key, key)} doesn't support "
-                f"{_SUPPLIER_TYPE_LABELS[stype]} suppliers. Pick a provider "
-                "that supports this supplier type."
-            )
-        provider_name = send_key
 
         attachment_data = []
         for upload in attachments:
@@ -308,26 +440,26 @@ async def send_email_form(
                     }
                 )
 
-        conversation = await service.create_conversation(
-            current_user["id"],
-            current_user["full_name"],
-            supplier_email,
-            supplier_name,
-            project_id=project_id,
-            project_name=project_name,
-            provider_name=provider_name,
-        )
-        conv_id = conversation["conv_id"]
-
-        await service.send_rfq(
-            user_id=current_user["id"],
-            conv_id=conv_id,
+        conv_id = await _resolve_draft(
+            service,
+            conv_id=conv_id.strip(),
+            current_user=current_user,
             supplier_email=supplier_email,
             supplier_name=supplier_name,
+            supplier_type=stype,
             product_name=product_name,
             quantity=quantity,
             target_price=target_price,
-            provider_name=provider_name,
+            project_id=project_id,
+            project_name=project_name,
+            provider_name=provider_name.strip().lower(),
+            send_key=send_key,
+        )
+
+        await service.send_rfq(
+            conv_id=conv_id,
+            user_id=current_user["id"],
+            provider_name=send_key,
             attachments=attachment_data or None,
         )
         return RedirectResponse(
@@ -347,6 +479,51 @@ async def send_email_form(
             f"{BASE_PATH}/send?error={quote(str(exc)[:300])}",
             status_code=303,
         )
+
+
+async def _resolve_draft(
+    service: ConversationService,
+    *,
+    conv_id: str,
+    current_user: dict,
+    **draft_fields,
+) -> str:
+    """Return the conv_id to send, creating a draft when there isn't one.
+
+    A supplied ``conv_id`` is only reused when it exists, belongs to the
+    current user and is still a draft — anything else (an unknown id, one
+    guessed from another account, or a conversation already sent) falls back
+    to minting a fresh draft rather than failing or, worse, re-sending on
+    someone else's conversation.
+
+    Args:
+        service (ConversationService): The conversation service.
+        conv_id (str): The candidate draft id from the form, possibly empty.
+        current_user (dict): The logged-in user.
+        **draft_fields: Passed straight to
+            :meth:`~src.services.conversation_service.ConversationService.create_draft`.
+
+    Returns:
+        str: The conversation id to send.
+    """
+    if conv_id:
+        existing = await service.db.get_conversation(conv_id)
+        if (
+            existing
+            and str(existing["user_id"]) == str(current_user["id"])
+            and existing["status"] == "draft"
+        ):
+            return conv_id
+        service.log.info(
+            "Ignoring conv_id %s on send (missing, not owned, or already "
+            "sent) — creating a fresh draft",
+            conv_id,
+        )
+
+    conversation = await service.create_draft(
+        user_id=current_user["id"], **draft_fields
+    )
+    return conversation["conv_id"]
 
 
 @router.get("/tracking")
@@ -476,49 +653,88 @@ async def delete_conversation(
     return RedirectResponse(f"{BASE_PATH}/tracking?deleted=1", status_code=303)
 
 
-# ── Inbound webhook (single URL for every provider) ──────────────────
+# ── Inbound webhooks (one URL per provider) ──────────────────────────
 
 
-@router.post("/webhooks/inbound")
-async def handle_inbound_email(request: Request):
-    """Receive and process one inbound email from any provider.
+@router.post("/webhooks/inbound/{provider_key}")
+async def handle_inbound_email_for(request: Request, provider_key: str):
+    """Receive and process one inbound email from a specific provider.
 
-    This is the single endpoint every provider's inbound feature posts to.
-    The provider-specific parsing, conversation matching, attachment
-    storage and reply classification all happen inside
-    :meth:`ConversationService.handle_inbound`; the inbound parser is fixed
-    at startup (``src.app._INBOUND_EMAIL_PROVIDER``) since this one endpoint
-    only understands one payload format at a time — independent of which
-    provider a sender picks per outbound send on the Send RFQ form.
-    Deliberately public — providers call this anonymously, so it is never
-    behind ``require_login``.
+    Inbound has to work for every provider, and no single parser can decode
+    every payload format — so the provider is named in the URL and the
+    matching parser is resolved per request (see
+    :meth:`ConversationService.get_parser`). Point each provider's dashboard
+    at its own path, e.g.
+    ``/email_poc/webhooks/inbound/engagelab``.
+
+    Alibaba has no inbound webhook at all: its replies arrive through the
+    IMAP poller (see :mod:`src.inbound.alibaba_imap_poller`) and feed the
+    same pipeline, so posting here as ``alibaba`` returns an error.
+
+    Parsing, conversation matching, attachment storage and reply
+    classification all happen inside
+    :meth:`ConversationService.handle_inbound`. Deliberately public —
+    providers call this anonymously, so it is never behind ``require_login``.
 
     Args:
         request (Request): FastAPI request. The body is form or JSON data
             depending on the provider.
+        provider_key (str): Which provider is posting, e.g. ``"engagelab"``.
 
     Returns:
         JSONResponse: The status payload from
             :meth:`ConversationService.handle_inbound` — one of ``matched``,
-            ``unmatched``, ``skipped`` (spam), ``rejected`` (bad signature)
-            or ``error`` — with a matching HTTP status code (200 for
-            matched/unmatched/skipped, 400 for rejected, 500 for error; see
-            :data:`_INBOUND_STATUS_CODES`).
+            ``unmatched``, ``duplicate``, ``skipped`` (spam), ``rejected``
+            (bad signature) or ``error`` — with a matching HTTP status code
+            (see :data:`_INBOUND_STATUS_CODES`).
     """
     service: ConversationService = request.app.state.service
-    result = await service.handle_inbound(request)
+    result = await service.handle_inbound(request, provider_key)
     status_code = _INBOUND_STATUS_CODES.get(result.get("status"), 200)
     return JSONResponse(content=result, status_code=status_code)
 
 
-@router.get("/webhooks/inbound")
-async def validate_inbound_webhook():
+@router.get("/webhooks/inbound/{provider_key}")
+async def validate_inbound_webhook_for(provider_key: str):
     """Answer the GET probe some providers send before saving a route.
 
     Elastic Email (and others) validate an inbound notification URL by
     issuing a ``GET`` and requiring a ``2xx`` response before they will save
     it. This handler exists solely to satisfy that probe. Deliberately
     public, same reasoning as the POST variant above.
+
+    Args:
+        provider_key (str): The provider path segment being validated.
+
+    Returns:
+        dict: ``{"status": "ok", "provider": provider_key}`` with an
+            implicit ``200`` status.
+    """
+    return {"status": "ok", "provider": provider_key}
+
+
+# ── Legacy aliases ───────────────────────────────────────────────────
+# Kept so provider dashboards configured against the old single-URL
+# endpoint keep delivering; they resolve to _DEFAULT_INBOUND_PROVIDER.
+# New configurations should use /webhooks/inbound/{provider}.
+
+
+@router.post("/webhooks/inbound")
+async def handle_inbound_email(request: Request):
+    """Legacy inbound endpoint — routes to the default provider's parser.
+
+    Args:
+        request (Request): FastAPI request.
+
+    Returns:
+        JSONResponse: Same as :func:`handle_inbound_email_for`.
+    """
+    return await handle_inbound_email_for(request, _DEFAULT_INBOUND_PROVIDER)
+
+
+@router.get("/webhooks/inbound")
+async def validate_inbound_webhook():
+    """Legacy validation probe for the un-suffixed inbound path.
 
     Returns:
         dict: ``{"status": "ok"}`` with an implicit ``200`` status.

@@ -113,13 +113,28 @@ class Conversation(Base):
     target_price: Mapped[str | None]
     supplier_name: Mapped[str]
     supplier_email: Mapped[str]
+    # 'chinese' | 'non_chinese' — picked on the form, decides which RFQ body
+    # template is rendered and which region a provider resolves to.
+    supplier_type: Mapped[str | None]
     subject: Mapped[str] = mapped_column(default="")
     token: Mapped[str] = mapped_column(unique=True)
-    reply_to_address: Mapped[str]
-    provider: Mapped[str]
-    status: Mapped[str] = mapped_column(default="open")
+    # What we actually sent From. No longer a random per-conversation address
+    # (the dynamic Reply-To scheme is gone) — kept purely as an audit trail,
+    # and NULL until the conversation leaves 'draft'.
+    from_address: Mapped[str | None]
+    # Nullable for the same reason: a draft can predate the provider choice.
+    provider: Mapped[str | None]
+    # The resolved factory key the send actually went through, e.g.
+    # 'alibaba_hk' where ``provider`` reads 'alibaba'.
+    send_key: Mapped[str | None]
+    status: Mapped[str] = mapped_column(default="draft")
+    # The reply classifier's verdict. Informational only — it no longer
+    # drives the status, which is always 'closed' once a reply binds.
+    last_action: Mapped[str | None]
     reply_count: Mapped[int] = mapped_column(default=0)
     last_reply_at: Mapped[datetime | None]
+    sent_at: Mapped[datetime | None]
+    closed_at: Mapped[datetime | None]
     created_at: Mapped[datetime] = mapped_column(default=_utcnow)
 
     user: Mapped["User"] = relationship(back_populates="conversations")
@@ -129,7 +144,7 @@ class Conversation(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "status IN ('open', 'replied', 'declined')",
+            "status IN ('draft', 'open', 'closed', 'failed')",
             name="ck_conversations_status",
         ),
     )
@@ -152,6 +167,9 @@ class Email(Base):
     subject: Mapped[str]
     body_html: Mapped[str | None] = mapped_column(Text)
     body_text: Mapped[str | None] = mapped_column(Text)
+    # The real RFC 5322 Message-ID that went on (or arrived over) the wire.
+    # UNIQUE, which is exactly what makes inbound ingestion idempotent — IMAP
+    # polling and webhook retries both re-deliver the same message.
     message_id: Mapped[str] = mapped_column(unique=True)
     in_reply_to: Mapped[str | None]
     references_header: Mapped[str | None] = mapped_column(Text)
@@ -161,6 +179,11 @@ class Email(Base):
     spf: Mapped[str | None]
     spam_score: Mapped[float | None] = mapped_column(Numeric)
     provider: Mapped[str]
+    # The provider's own id for this send (EngageLab email_ids[0], SendCloud
+    # info.emailIdList[0], SendGrid X-Message-Id, ...), distinct from the RFC
+    # Message-ID above.
+    provider_message_id: Mapped[str | None]
+    status_code: Mapped[int | None]
     created_at: Mapped[datetime] = mapped_column(default=_utcnow)
 
     conversation: Mapped["Conversation"] = relationship(back_populates="emails")
@@ -193,6 +216,14 @@ class Attachment(Base):
 
 
 class UnmatchedEmail(Base):
+    """An inbound email none of the matching strategies could bind.
+
+    Requirement 4, step 4: when neither the threading headers nor the subject
+    token resolve a conversation, the whole message is retained here — sender,
+    subject, both bodies, the threading headers and its attachments — so it
+    can still be reviewed and, later, attached to the right conversation.
+    """
+
     __tablename__ = "unmatched_emails"
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -201,6 +232,13 @@ class UnmatchedEmail(Base):
     raw_payload: Mapped[dict] = mapped_column(JSONB)
     to_email: Mapped[str | None]
     from_email: Mapped[str | None]
+    subject: Mapped[str | None]
+    body_text: Mapped[str | None] = mapped_column(Text)
+    body_html: Mapped[str | None] = mapped_column(Text)
+    provider: Mapped[str | None]
+    message_id: Mapped[str | None]
+    in_reply_to: Mapped[str | None]
+    references_header: Mapped[str | None] = mapped_column(Text)
     reason: Mapped[str]
     candidate_conversation_ids: Mapped[list[uuid.UUID] | None] = mapped_column(
         ARRAY(UUID(as_uuid=True))
@@ -209,11 +247,43 @@ class UnmatchedEmail(Base):
     resolved_conversation_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("conversations.id")
     )
+    received_at: Mapped[datetime | None]
     created_at: Mapped[datetime] = mapped_column(default=_utcnow)
+
+    attachments: Mapped[list["UnmatchedAttachment"]] = relationship(
+        back_populates="unmatched_email", cascade="all, delete-orphan"
+    )
 
     __table_args__ = (
         CheckConstraint(
             "status IN ('needs_review', 'resolved', 'ignored')",
             name="ck_unmatched_emails_status",
         ),
+    )
+
+
+class UnmatchedAttachment(Base):
+    """Files that arrived on an unmatched inbound email.
+
+    Mirrors :class:`Attachment` exactly, but hangs off ``unmatched_emails``
+    since no conversation exists to namespace them under.
+    """
+
+    __tablename__ = "unmatched_attachments"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    unmatched_email_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("unmatched_emails.id", ondelete="CASCADE"),
+        index=True,
+    )
+    filename: Mapped[str]
+    url: Mapped[str]
+    content_type: Mapped[str | None]
+    size_bytes: Mapped[int | None]
+
+    unmatched_email: Mapped["UnmatchedEmail"] = relationship(
+        back_populates="attachments"
     )

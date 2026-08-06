@@ -61,12 +61,17 @@
   <div class="conv-info-item">
     <div class="conv-info-label">Status</div>
     <div class="conv-info-value">
-      {% if conversation.status == 'replied' %}
-        <span class="badge badge-replied">Replied</span>
-      {% elif conversation.status == 'declined' %}
-        <span class="badge badge-declined">Declined</span>
+      {% if conversation.status == 'draft' %}
+        <span class="badge badge-draft">Draft</span>
+      {% elif conversation.status == 'closed' %}
+        <span class="badge badge-replied">Closed</span>
+      {% elif conversation.status == 'failed' %}
+        <span class="badge badge-declined">Failed</span>
       {% else %}
         <span class="badge badge-open">Open</span>
+      {% endif %}
+      {% if conversation.last_action %}
+        <div class="text-xs text-muted" style="margin-top:4px;">{{ conversation.last_action }}</div>
       {% endif %}
     </div>
   </div>
@@ -75,8 +80,19 @@
     <div class="conv-info-value">{{ conversation.reply_count or 0 }}</div>
   </div>
   <div class="conv-info-item">
-    <div class="conv-info-label">Dynamic Address</div>
-    <div class="conv-info-value font-mono" style="font-size:11px; word-break:break-all;">{{ conversation.email_address }}</div>
+    <div class="conv-info-label">Sent From</div>
+    <div class="conv-info-value font-mono" style="font-size:11px; word-break:break-all;">
+      {{ conversation.from_address or '—' }}
+    </div>
+  </div>
+  <div class="conv-info-item">
+    <div class="conv-info-label">Provider / Region</div>
+    <div class="conv-info-value" style="font-size:12px;">
+      {{ conversation.provider or '—' }}
+      {% if conversation.send_key and conversation.send_key != conversation.provider %}
+        <span class="text-xs text-muted">({{ conversation.send_key }})</span>
+      {% endif %}
+    </div>
   </div>
 </div>
 
@@ -117,6 +133,16 @@
           <span class="badge" style="font-size:10px; background:#fff3e0; color:#cc6600; border:1px solid #ffd699;">⇒ Forwarded</span>
         {% elif email.email_type == 'new_thread' %}
           <span class="badge" style="font-size:10px; background:#e6f9e6; color:#1a7a1a; border:1px solid #99d699;">✉ New Thread</span>
+        {% endif %}
+        {% if email.matched_via %}
+          {# How this reply was bound to the conversation. 'message_id' means
+             the RFC headers survived the provider; 'subject_token' means they
+             didn't and the [RFQ - id] subject prefix did the work — which
+             makes threading regressions obvious at a glance. #}
+          <span class="badge badge-neutral" style="font-size:10px;"
+                title="How this reply was matched to the conversation">
+            🔗 {{ email.matched_via }}
+          </span>
         {% endif %}
         <span>
           {% set ts = email.sent_at or email.received_at or '' %}

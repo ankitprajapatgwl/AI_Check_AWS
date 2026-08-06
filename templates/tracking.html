@@ -12,17 +12,21 @@
     <div class="stat-value">{{ stats.total }}</div>
     <div class="stat-label">Conversations</div>
   </div>
+  <div class="stat-card">
+    <div class="stat-value" style="color: var(--txt2);">{{ stats.draft }}</div>
+    <div class="stat-label">Draft</div>
+  </div>
   <div class="stat-card amber">
     <div class="stat-value">{{ stats.open }}</div>
     <div class="stat-label">Awaiting Reply</div>
   </div>
   <div class="stat-card green">
-    <div class="stat-value">{{ stats.replied }}</div>
-    <div class="stat-label">Replied</div>
+    <div class="stat-value">{{ stats.closed }}</div>
+    <div class="stat-label">Closed</div>
   </div>
   <div class="stat-card">
-    <div class="stat-value" style="color: var(--danger);">{{ stats.declined }}</div>
-    <div class="stat-label">Declined</div>
+    <div class="stat-value" style="color: var(--danger);">{{ stats.failed }}</div>
+    <div class="stat-label">Failed</div>
   </div>
 </div>
 
@@ -66,10 +70,12 @@
           <td>{{ conv.quantity or '—' }}</td>
           <td>{{ conv.target_price or '—' }}</td>
           <td>
-            {% if conv.status == 'replied' %}
-              <span class="badge badge-replied">Replied</span>
-            {% elif conv.status == 'declined' %}
-              <span class="badge badge-declined">Declined</span>
+            {% if conv.status == 'draft' %}
+              <span class="badge badge-draft">Draft</span>
+            {% elif conv.status == 'closed' %}
+              <span class="badge badge-replied">Closed</span>
+            {% elif conv.status == 'failed' %}
+              <span class="badge badge-declined">Failed</span>
             {% else %}
               <span class="badge badge-open">Open</span>
             {% endif %}

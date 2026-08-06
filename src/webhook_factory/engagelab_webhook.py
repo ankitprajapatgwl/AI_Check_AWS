@@ -149,6 +149,7 @@ class EngageLabWebhookParser(WebhookParserMaster):
         except (TypeError, ValueError):
             spam_score = 0.0
 
+        headers = parsed.get("headers", {})
         inbound = InboundEmail(
             from_email=parsed.get("from", ""),
             to_email=parsed.get("to", ""),
@@ -159,14 +160,21 @@ class EngageLabWebhookParser(WebhookParserMaster):
             dkim=parsed.get("dkim", ""),
             spf=parsed.get("spf", ""),
             provider=self.provider_name,
+            message_id=headers.get("message-id", ""),
+            in_reply_to=headers.get("in-reply-to", ""),
+            references=headers.get("references", ""),
+            headers=headers,
+            raw_message=parsed.get("raw_message", ""),
         )
         inbound.attachments = parsed.get("attachments", [])
 
         self.log.info(
-            "Parsed EngageLab inbound: %s -> %s (%d attachment(s))",
+            "Parsed EngageLab inbound: %s -> %s (%d attachment(s), "
+            "message_id=%s)",
             inbound.from_email,
             inbound.to_email,
             len(inbound.attachments),
+            inbound.message_id or "-",
         )
         return inbound
 
@@ -185,15 +193,36 @@ class EngageLabWebhookParser(WebhookParserMaster):
 
         Returns:
             dict: Normalised keys ``from``, ``to``, ``subject``, ``text``,
-                ``html``, ``spam_score``, ``dkim``, ``spf`` and
-                ``attachments`` (a ``list[RawAttachment]``).
+                ``html``, ``spam_score``, ``dkim``, ``spf``, ``headers``
+                (lowercase-keyed), ``raw_message`` and ``attachments`` (a
+                ``list[RawAttachment]``).
 
         Raises:
             WebhookParseError: If the fields cannot be read.
         """
         try:
             response_data = self._response_data(payload)
-            headers = response_data.get("headers") or {}
+            payload_headers = response_data.get("headers") or {}
+
+            # The raw MIME source is fetched once and parsed once: it is the
+            # only reliable place to read the threading headers *and* the
+            # only place attachments exist, so both come off the same object.
+            raw_eml = await self._raw_message(response_data)
+            msg = (
+                email.message_from_string(raw_eml, policy=email_default_policy)
+                if raw_eml
+                else None
+            )
+
+            headers = {
+                str(key).lower(): str(value)
+                for key, value in (payload_headers or {}).items()
+            }
+            if msg is not None:
+                # Headers off the real MIME source win over the payload's
+                # summarised copy — that copy has been observed to omit
+                # In-Reply-To entirely.
+                headers.update(self.headers_from_mime(msg))
 
             from_addr = (
                 response_data.get("from")
@@ -210,18 +239,21 @@ class EngageLabWebhookParser(WebhookParserMaster):
                 "from": self._clean_address(from_addr),
                 "to": self._clean_address(to_addr),
                 "subject": response_data.get("subject")
-                or payload.get("subject", ""),
+                or payload.get("subject")
+                or headers.get("subject", ""),
                 "text": response_data.get("text") or payload.get("text", ""),
                 "html": response_data.get("html") or payload.get("html", ""),
                 "spam_score": payload.get("spam_score", 0) or 0,
                 "dkim": response_data.get("dkim")
                 or payload.get("dkim")
-                or ("pass" if headers.get("DKIM-Signature") else ""),
+                or ("pass" if headers.get("dkim-signature") else ""),
                 "spf": response_data.get("spf")
                 or payload.get("spf")
-                or headers.get("Received-SPF", ""),
-                "attachments": await self._extract_attachments(
-                    response_data, payload
+                or headers.get("received-spf", ""),
+                "headers": headers,
+                "raw_message": raw_eml or "",
+                "attachments": self._extract_attachments(
+                    response_data, payload, msg
                 ),
             }
         except Exception as exc:  # noqa: BLE001 - normalise to one type
@@ -273,33 +305,21 @@ class EngageLabWebhookParser(WebhookParserMaster):
         _, addr = parseaddr(value)
         return addr or value
 
-    async def _extract_attachments(
-        self, response_data: dict, payload
-    ) -> list[RawAttachment]:
-        """Recover attachments from an EngageLab inbound payload.
+    async def _raw_message(self, response_data: dict) -> str:
+        """Return the inbound message's raw MIME source, downloading if needed.
 
-        EngageLab does not post a structured ``attachments`` array; the
-        only source is the raw MIME message. This checks, in order: an
-        explicit ``attachments`` array (kept for the setup guide's original
-        guessed shape), the inline ``raw_message``, then a download of
-        ``raw_message_url`` when no inline copy is present.
+        EngageLab inlines the source in ``raw_message`` most of the time, but
+        falls back to a ``raw_message_url`` when it is large. A failed
+        download is logged and returns ``""`` rather than raising: losing the
+        headers degrades matching to the subject token, which is far better
+        than dropping the whole reply.
 
         Args:
-            response_data (dict): The unwrapped ``response.response_data``
-                object.
-            payload: The full JSON/form payload, checked for a top-level
-                ``attachments`` fallback.
+            response_data (dict): The unwrapped ``response.response_data``.
 
         Returns:
-            list[RawAttachment]: One entry per decodable attachment; empty
-                when the message carried none or none could be recovered.
+            str: The raw ``.eml`` source, or ``""`` if unavailable.
         """
-        explicit = response_data.get("attachments") or payload.get(
-            "attachments"
-        )
-        if explicit:
-            return self._parse_attachments(explicit)
-
         raw_eml = response_data.get("raw_message")
         raw_url = response_data.get("raw_message_url")
 
@@ -324,25 +344,36 @@ class EngageLabWebhookParser(WebhookParserMaster):
                     raw_url,
                     exc,
                 )
+        return raw_eml or ""
 
-        if not raw_eml:
-            return []
+    def _extract_attachments(
+        self, response_data: dict, payload, msg
+    ) -> list[RawAttachment]:
+        """Recover attachments from an EngageLab inbound payload.
 
-        msg = email.message_from_string(raw_eml, policy=email_default_policy)
-        attachments: list[RawAttachment] = []
-        for part in msg.walk():
-            if (
-                part.get_content_disposition() != "attachment"
-                and not part.get_filename()
-            ):
-                continue
+        EngageLab does not post a structured ``attachments`` array; the only
+        real source is the raw MIME message, already parsed by the caller.
+        An explicit ``attachments`` array is still checked first, for the
+        setup guide's original guessed shape.
 
-            filename = part.get_filename() or "unnamed_attachment"
-            content_type = part.get_content_type() or "application/octet-stream"
-            content = part.get_payload(decode=True)
-            if content:
-                attachments.append(RawAttachment(filename, content_type, content))
-        return attachments
+        Args:
+            response_data (dict): The unwrapped ``response.response_data``
+                object.
+            payload: The full JSON/form payload, checked for a top-level
+                ``attachments`` fallback.
+            msg: The parsed MIME message, or ``None`` when no raw source was
+                available.
+
+        Returns:
+            list[RawAttachment]: One entry per decodable attachment; empty
+                when the message carried none or none could be recovered.
+        """
+        explicit = response_data.get("attachments") or payload.get(
+            "attachments"
+        )
+        if explicit:
+            return self._parse_attachments(explicit)
+        return self.attachments_from_mime(msg)
 
     def _parse_attachments(self, raw_attachments) -> list[RawAttachment]:
         """Decode base64 attachment entries from an explicit attachments array.
