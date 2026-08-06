@@ -294,9 +294,18 @@ class Settings:
         # Alibaba has no inbound webhook, so replies are polled (see
         # src/inbound/alibaba_imap_poller.py). Set this to false on every
         # replica but one — each replica otherwise polls the same mailbox.
+        # Region-specific flags take precedence over the global flag.
         self.alibaba_inbound_enabled = (
             os.getenv("ALIBABA_INBOUND_ENABLED", "true").strip().lower()
             == "true"
+        )
+        # Singapore region polling (optional; falls back to global flag)
+        self.alibaba_imap_polling_enabled = (
+            os.getenv("ALIBABA_IMAP_POLLING_ENABLED", "").strip().lower()
+        )
+        # Hong Kong region polling (optional; falls back to global flag)
+        self.alibaba_hk_imap_polling_enabled = (
+            os.getenv("ALIBABA_HK_IMAP_POLLING_ENABLED", "").strip().lower()
         )
         self.alibaba_poll_interval_seconds = int(
             os.getenv(

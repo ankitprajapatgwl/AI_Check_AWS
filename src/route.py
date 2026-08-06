@@ -69,17 +69,19 @@ _SUPPLIER_TYPE_LABELS = {"chinese": "Chinese", "non_chinese": "Non-Chinese"}
 # and which internal factory key (see src/email_platform/factory.py) that
 # combination resolves to.
 #
-# SendCloud and Alibaba both reach Chinese *and* non-Chinese recipients, but
-# through different regions: SendCloud's Hong Kong/CN vs Singapore base URLs
-# are region-locked to separate credentials
-# (setup_docs/aurora_send_cloud/AuroraSendCloud_Documentation.md §2), and
-# Alibaba's Hong Kong SMTP host sits closer to Chinese mailboxes than its
-# Singapore one — so "+ chinese" resolves to the separate "_hk" factory key
-# for both. EngageLab's two data centers (Singapore/Turkey, per
-# setup_docs/engagelab_guide/Engagelab_Documentation.md §2) aren't documented
-# as a China-vs-non-China split, so it sends through the same Singapore
-# endpoint for both supplier types. SendGrid has no regional split and is
+# SendCloud and Alibaba (the provider) both reach Chinese *and* non-Chinese
+# recipients through different servers: SendCloud's Hong Kong/CN vs Singapore
+# base URLs are region-locked to separate credentials (see
+# setup_docs/aurora_send_cloud/AuroraSendCloud_Documentation.md §2), and
+# Alibaba's Hong Kong server is better positioned for Chinese mailboxes than
+# its Singapore server — so "+ chinese" supplier type resolves to the separate
+# "_hk" factory key for both providers. EngageLab's two data centers
+# (Singapore/Turkey, per setup_docs/engagelab_guide/Engagelab_Documentation.md
+# §2) aren't documented as a China-vs-non-China split, so it sends through the
+# same Singapore endpoint for both. SendGrid has no regional split and is
 # reserved for Non-Chinese suppliers.
+# NOTE: For Alibaba, the factory keys are alibaba_sg (Singapore server, uses
+# "alibaba" key here) and alibaba_hk (Hong Kong server).
 _SEND_KEYS = {
     ("sendcloud", "chinese"): "sendcloud_hk",
     ("sendcloud", "non_chinese"): "sendcloud",
@@ -92,14 +94,16 @@ _SEND_KEYS = {
 
 # Which region each (provider, supplier type) pair actually sends through,
 # shown as a hint on the Quick Send cards so a tester knows what they're
-# exercising without reading _SEND_KEYS.
+# exercising without reading _SEND_KEYS. For Alibaba, the suffix denotes the
+# server region: _sg = Singapore server (Non-Chinese suppliers), _hk = Hong
+# Kong server (Chinese suppliers).
 _SEND_KEY_HINTS = {
     "sendcloud": "Hong Kong/CN region",
     "sendcloud_hk": "Hong Kong/CN region",
     "engagelab": "Singapore region",
     "sendgrid": "Global",
-    "alibaba": "Singapore SMTP",
-    "alibaba_hk": "Hong Kong SMTP",
+    "alibaba": "Alibaba Singapore server",
+    "alibaba_hk": "Alibaba Hong Kong server",
 }
 
 # Which parser the legacy un-suffixed /webhooks/inbound path uses. Kept so

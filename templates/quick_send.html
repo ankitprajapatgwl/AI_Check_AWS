@@ -31,24 +31,39 @@
   <div class="compose-card-body">
     <div class="form-grid">
 
-      {% for stype, stype_label, badge in [
-           ("chinese", "Chinese", "CN"),
-           ("non_chinese", "Non-Chinese", "Non-CN")] %}
-        {% if stype in provider.supported_types %}
+      {% if provider.key == "alibaba" %}
+        {# Alibaba: single input and button for both Chinese and Non-Chinese #}
         <div class="form-group qs-section">
-          <label>{{ stype_label }} <span class="qs-type-badge {{ stype }}">{{ badge }}</span></label>
-          {# Names the region this card actually resolves to (see
-             src.route._SEND_KEYS), so a tester knows what they're exercising. #}
-          <span class="qs-provider-hint">→ {{ provider.region_hints[stype] }}</span>
+          <label>Send to Both Chinese & Non-Chinese</label>
+          <span class="qs-provider-hint">→ {{ provider.region_hints.get("non_chinese", "Alibaba Singapore server") }} + {{ provider.region_hints.get("chinese", "Alibaba Hong Kong server") }}</span>
           <input type="email" class="qs-email" placeholder="destination@example.com">
           <button type="button" class="btn btn-primary mt-8"
-                  onclick="quickSend('{{ provider.key }}', '{{ stype }}', this)">
-            <span>📤</span> Send with {{ provider.label }} to {{ badge }}
+                  onclick="quickSendAlibaba('{{ provider.key }}', this)">
+            <span>📤</span> Send with {{ provider.label }} to Both
           </button>
           <div class="qs-status text-sm"></div>
         </div>
-        {% endif %}
-      {% endfor %}
+      {% else %}
+        {# Other providers: separate sections for Chinese and Non-Chinese #}
+        {% for stype, stype_label, badge in [
+             ("chinese", "Chinese", "CN"),
+             ("non_chinese", "Non-Chinese", "Non-CN")] %}
+          {% if stype in provider.supported_types %}
+          <div class="form-group qs-section">
+            <label>{{ stype_label }} <span class="qs-type-badge {{ stype }}">{{ badge }}</span></label>
+            {# Names the region this card actually resolves to (see
+               src.route._SEND_KEYS), so a tester knows what they're exercising. #}
+            <span class="qs-provider-hint">→ {{ provider.region_hints[stype] }}</span>
+            <input type="email" class="qs-email" placeholder="destination@example.com">
+            <button type="button" class="btn btn-primary mt-8"
+                    onclick="quickSend('{{ provider.key }}', '{{ stype }}', this)">
+              <span>📤</span> Send with {{ provider.label }} to {{ badge }}
+            </button>
+            <div class="qs-status text-sm"></div>
+          </div>
+          {% endif %}
+        {% endfor %}
+      {% endif %}
 
     </div>
   </div>
@@ -58,12 +73,13 @@
 <div style="margin-top: 24px; padding: 16px 20px; background: var(--card); border: 1px solid var(--border); border-radius: var(--r);">
   <div style="font-size: 13px; font-weight: 600; margin-bottom: 8px; color: var(--txt2);">How it works</div>
   <ol style="padding-left: 18px; font-size: 13px; color: var(--txt2); line-height: 1.8;">
-    <li>Enter only the destination email in the section for the provider and supplier type you want to test. Each section shows the region it resolves to.</li>
+    <li>Enter only the destination email in the section for the provider and supplier type you want to test. Each section shows the server/region it resolves to.</li>
     <li>Supplier name, product, quantity and target price are all filled in with fixed test defaults automatically.</li>
     <li>Clicking Send calls the same <code style="background:var(--bg);padding:1px 5px;border-radius:3px;">POST /send</code> endpoint as the full Send RFQ form — so the conversation is created as a draft first, then flipped to Open once the provider accepts it.</li>
     <li>The email's subject is <code style="background:var(--bg);padding:1px 5px;border-radius:3px;">[RFQ - id] - …</code> and it carries its own <code style="background:var(--bg);padding:1px 5px;border-radius:3px;">Message-ID</code>. There is no per-conversation reply address: a reply is matched by <code style="background:var(--bg);padding:1px 5px;border-radius:3px;">Message-ID</code>/<code style="background:var(--bg);padding:1px 5px;border-radius:3px;">References</code>, falling back to that subject prefix.</li>
-    <li>Chinese sections send the Simplified-Chinese body template; Non-Chinese sections send the English one.</li>
-    <li>On a successful send, the conversation's tracking page opens automatically in a new tab.</li>
+    <li>All sections send the English HTML template regardless of supplier type.</li>
+    <li><strong>Alibaba:</strong> The single "Send to Both" button sends to both Chinese and Non-Chinese suppliers with separate conversations, using the Alibaba Hong Kong and Singapore servers respectively.</li>
+    <li>On a successful send, the conversation's tracking page opens automatically in a new tab (or multiple tabs for Alibaba).</li>
   </ol>
 </div>
 
@@ -139,6 +155,90 @@
         btn.disabled = false;
         btn.innerHTML = originalText;
       });
+  }
+
+  function quickSendAlibaba(providerKey, btn) {
+    var section = btn.closest(".qs-section");
+    var emailInput = section.querySelector(".qs-email");
+    var statusEl = section.querySelector(".qs-status");
+    var email = emailInput.value.trim();
+
+    if (!email) {
+      emailInput.focus();
+      statusEl.className = "qs-status text-sm qs-status-err";
+      statusEl.textContent = "❌ Enter a destination email first.";
+      return;
+    }
+
+    var originalText = btn.innerHTML;
+    btn.disabled = true;
+    btn.innerHTML = "<span>⏳</span> Sending…";
+    statusEl.className = "qs-status text-sm";
+    statusEl.textContent = "";
+
+    var providerLabel = PROVIDER_LABELS[providerKey] || providerKey;
+    var sentConvIds = [];
+    var failedCount = 0;
+
+    // Send to both Chinese and Non-Chinese suppliers
+    function sendToSupplierType(supplierType, callback) {
+      var typeLabel = TYPE_LABELS[supplierType] || supplierType;
+      var identifier = providerLabel + " - " + typeLabel;
+
+      var formData = new FormData();
+      formData.append("provider_name", providerKey);
+      formData.append("supplier_type", supplierType);
+      formData.append("supplier_email", email);
+      formData.append("supplier_name", "QA Test Supplier (" + identifier + ")");
+      formData.append("product_name", "Quick Test Product (" + identifier + ")");
+      formData.append("quantity", "10");
+      formData.append("target_price", "$10.00");
+      formData.append("project_id", "");
+      formData.append("project_name", "");
+
+      fetch(BASE_PATH + "/send", { method: "POST", body: formData })
+        .then(function (res) {
+          if (res.url && res.url.indexOf("/tracking/") !== -1 && res.url.indexOf("error=") === -1) {
+            var convId = res.url.split("/tracking/")[1].split("?")[0];
+            sentConvIds.push({ type: typeLabel, id: convId });
+            window.open(res.url, "_blank", "noopener");
+          } else {
+            failedCount++;
+          }
+          callback();
+        })
+        .catch(function () {
+          failedCount++;
+          callback();
+        });
+    }
+
+    var completed = 0;
+    sendToSupplierType("chinese", function () {
+      completed++;
+      if (completed === 2) onBothSent();
+    });
+    sendToSupplierType("non_chinese", function () {
+      completed++;
+      if (completed === 2) onBothSent();
+    });
+
+    function onBothSent() {
+      if (failedCount === 0 && sentConvIds.length === 2) {
+        statusEl.className = "qs-status text-sm qs-status-ok";
+        statusEl.textContent = "✅ Sent to both: Chinese [RFQ - " + sentConvIds[0].id +
+          "] + Non-Chinese [RFQ - " + sentConvIds[1].id + "] — opened tracking in new tabs.";
+      } else if (sentConvIds.length > 0) {
+        statusEl.className = "qs-status text-sm qs-status-ok";
+        var convMsg = sentConvIds.map(c => "[RFQ - " + c.id + "] (" + c.type + ")").join(" + ");
+        statusEl.textContent = "✅ Sent " + sentConvIds.length + " (some failures): " + convMsg;
+      } else {
+        statusEl.className = "qs-status text-sm qs-status-err";
+        statusEl.textContent = "❌ Send failed to both types. Please try again.";
+      }
+      btn.disabled = false;
+      btn.innerHTML = originalText;
+    }
   }
 </script>
 {% endblock %}

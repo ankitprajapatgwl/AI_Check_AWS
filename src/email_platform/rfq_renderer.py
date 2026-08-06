@@ -1,16 +1,9 @@
 """The one and only renderer for RFQ email bodies.
 
-Every provider sends the exact same markup, produced here from a Jinja
-template under ``templates/emails/`` — there is no per-provider body and no
-``text/plain`` alternative anywhere in the pipeline (requirement 8). Two
-templates exist, chosen by supplier type:
-
-============== ==========================================================
-supplier_type  Template
-============== ==========================================================
-``chinese``    ``emails/rfq_email_zh.html`` (Simplified Chinese copy)
-anything else  ``emails/rfq_email.html`` (English copy)
-============== ==========================================================
+Every provider sends the exact same markup — an English HTML template —
+produced here from a Jinja template under ``templates/emails/``. There is
+no per-provider body, no language variants, and no ``text/plain`` alternative
+anywhere in the pipeline (requirement 8).
 
 :meth:`~src.email_platform.email_master.EmailMaster.build_rfq_html`
 delegates here, so provider code and the service layer keep one call site.
@@ -19,10 +12,10 @@ Example:
     >>> from src.config import get_settings
     >>> from src.email_platform.rfq_renderer import RfqRenderer
     >>> html = RfqRenderer(get_settings()).render(   # doctest: +SKIP
-    ...     supplier_type="chinese", company="IMS Flow",
+    ...     supplier_type="non_chinese", company="IMS Flow",
     ...     conv_id="hd273hsd", supplier_name="Acme",
     ...     product_name="X200", quantity=500, target_price="$12.00")
-    >>> "询价" in html                                # doctest: +SKIP
+    >>> "Dear" in html                               # doctest: +SKIP
     True
 """
 
@@ -30,12 +23,8 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from src.config import Settings
 
-# Template chosen when the supplier is Chinese; everything else uses the
-# English one. Kept as constants so the Alibaba/SendCloud region routing and
-# the renderer agree on exactly one spelling of the supplier type.
-_TEMPLATE_ZH = "emails/rfq_email_zh.html"
+# All RFQs are sent with the English template regardless of supplier type.
 _TEMPLATE_EN = "emails/rfq_email.html"
-_SUPPLIER_TYPE_CHINESE = "chinese"
 
 
 class RfqRenderer:
@@ -87,8 +76,8 @@ class RfqRenderer:
         """Render the RFQ body for one conversation.
 
         Args:
-            supplier_type (str): ``"chinese"`` selects the Chinese template;
-                anything else (including ``""``/``None``) uses English.
+            supplier_type (str): Not used — all RFQs are rendered with the
+                English template regardless of supplier type.
             company (str): Sending company display name, used in the banner
                 and the signature.
             conv_id (str): The conversation id shown in the reference footer.
@@ -100,12 +89,7 @@ class RfqRenderer:
         Returns:
             str: The rendered HTML body.
         """
-        name = (
-            _TEMPLATE_ZH
-            if (supplier_type or "").strip().lower() == _SUPPLIER_TYPE_CHINESE
-            else _TEMPLATE_EN
-        )
-        return self._env.get_template(name).render(
+        return self._env.get_template(_TEMPLATE_EN).render(
             company=company,
             conv_id=conv_id,
             supplier_name=supplier_name,

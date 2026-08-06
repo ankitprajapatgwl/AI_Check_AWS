@@ -369,7 +369,7 @@
     // what goes on the wire (the real id replaces the placeholder as soon as
     // the draft is created).
     var subjectEl = document.getElementById("prev-subject");
-    var base = supplierType === "chinese" ? "询价请求" : "Request for Quotation";
+    var base = supplierType === "chinese" ? "Request for Quotation" : "Request for Quotation";
     subjectEl.textContent = "[RFQ - " + (draftConvId || "••••••••") + "] - " +
       base + (productName ? " — " + productName : "");
 

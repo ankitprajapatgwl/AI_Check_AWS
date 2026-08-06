@@ -1,8 +1,8 @@
 """Background IMAP poller for Alibaba Enterprise Mail inbound replies.
 
-Alibaba Enterprise Mail offers no inbound webhook, so replies are pulled
-instead of pushed: one :class:`AlibabaImapPoller` per configured region
-(Singapore and/or Hong Kong) logs into the mailbox every
+Alibaba Enterprise Mail (the provider) offers no inbound webhook, so replies
+are pulled instead of pushed: one :class:`AlibabaImapPoller` per configured
+server (Singapore and/or Hong Kong) logs into the mailbox every
 ``ALIBABA_POLL_INTERVAL_SECONDS``, fetches everything ``UNSEEN``, converts
 each message to an
 :class:`~src.webhook_factory.webhook_master.InboundEmail` via
@@ -20,9 +20,10 @@ and the ``email_exists`` idempotency guard makes that a no-op.
 
    With more than one app replica, every replica polls the same mailbox and
    does the same work (safe, thanks to the guard above, but wasteful). For
-   the POC, run the poller on a single instance — set
-   ``ALIBABA_INBOUND_ENABLED=false`` on the others — or move it to a
-   dedicated worker.
+   the POC, run the poller on a single instance — set the region-specific
+   polling flags (``ALIBABA_IMAP_POLLING_ENABLED``,
+   ``ALIBABA_HK_IMAP_POLLING_ENABLED``) to ``false`` on the others, or move
+   polling to a dedicated worker.
 
 :mod:`imaplib` is entirely blocking, so every IMAP call runs through
 :func:`asyncio.to_thread`.
@@ -61,12 +62,12 @@ class AlibabaImapPoller:
             whose ``process_inbound`` each fetched message is handed to.
         settings (Settings): Shared application configuration.
         log (logging.Logger): Shared application logger.
-        region_key (str): ``"alibaba"`` or ``"alibaba_hk"`` — recorded as the
-            inbound email's provider.
+        region_key (str): ``"alibaba"`` (Singapore server) or ``"alibaba_hk"``
+            (Hong Kong server) — recorded as the inbound email's provider.
 
     Example:
         >>> poller = AlibabaImapPoller(          # doctest: +SKIP
-        ...     service, settings, logger, host="imap.qiye.aliyun.com",
+        ...     service, settings, logger, host="imap.sg.aliyun.com",
         ...     port=993, address="a@b.com", password="…",
         ...     mailbox="INBOX", region_key="alibaba")
     """
@@ -315,18 +316,23 @@ class AlibabaImapPoller:
 def build_alibaba_pollers(
     service, settings: Settings, logger: logging.Logger
 ) -> list[AlibabaImapPoller]:
-    """Build one poller per configured Alibaba region.
+    """Build one poller per configured Alibaba server.
 
-    A region is included only when it has a mailbox address *and* a password
-    configured, so a deployment that uses just one region doesn't start a
+    A server is included only when it has a mailbox address *and* a password
+    configured, so a deployment that uses just one server doesn't start a
     second poller that would fail on every tick.
 
-    Regions are deduplicated by ``(address, mailbox)`` and deliberately *not*
-    by host: ``imap.qiye.aliyun.com`` and ``imaphk.qiye.aliyun.com`` are
-    regional access points to the same Alibaba mailbox, so with the default
-    configuration — where the ``ALIBABA_HK_*`` credentials fall back to the
-    Singapore ones — two pollers would otherwise race over the same messages
-    and both try to flag them. One mailbox, one poller.
+    Servers are deduplicated by ``(address, mailbox)`` and deliberately *not*
+    by host: ``imap.sg.aliyun.com`` and ``imap.hk.aliyun.com`` are
+    server-specific access points to the same Alibaba mailbox, so with the
+    default configuration — where the ``ALIBABA_HK_*`` credentials fall back
+    to the Singapore ones — two pollers would otherwise race over the same
+    messages and both try to flag them. One mailbox, one poller.
+
+    Server-specific polling flags (ALIBABA_IMAP_POLLING_ENABLED for Singapore
+    and ALIBABA_HK_IMAP_POLLING_ENABLED for Hong Kong) take precedence over
+    the global ALIBABA_INBOUND_ENABLED flag. When a server-specific flag is
+    set, it controls whether a poller is created for that server.
 
     Args:
         service: The conversation service to hand messages to.
@@ -345,6 +351,7 @@ def build_alibaba_pollers(
             "password": settings.alibaba_mail_password,
             "mailbox": settings.alibaba_imap_mailbox,
             "processed_mailbox": settings.alibaba_imap_processed_mailbox,
+            "polling_enabled_env": settings.alibaba_imap_polling_enabled,
         },
         {
             "region_key": "alibaba_hk",
@@ -354,6 +361,7 @@ def build_alibaba_pollers(
             "password": settings.alibaba_hk_mail_password,
             "mailbox": settings.alibaba_hk_imap_mailbox,
             "processed_mailbox": settings.alibaba_hk_imap_processed_mailbox,
+            "polling_enabled_env": settings.alibaba_hk_imap_polling_enabled,
         },
     ]
 
@@ -366,11 +374,26 @@ def build_alibaba_pollers(
                 region["region_key"],
             )
             continue
+
+        # Check server-specific polling flag, fall back to global flag
+        polling_enabled_env = region.pop("polling_enabled_env")
+        if polling_enabled_env:
+            polling_enabled = polling_enabled_env == "true"
+        else:
+            polling_enabled = settings.alibaba_inbound_enabled
+
+        if not polling_enabled:
+            logger.info(
+                "Alibaba IMAP poller for %s disabled by configuration",
+                region["region_key"],
+            )
+            continue
+
         identity = (region["address"].strip().lower(), region["mailbox"])
         if identity in seen:
             logger.info(
                 "Alibaba IMAP poller for %s polls the same mailbox (%s/%s) as "
-                "an already-configured region, skipping the duplicate",
+                "an already-configured server, skipping the duplicate",
                 region["region_key"],
                 region["address"],
                 region["mailbox"],

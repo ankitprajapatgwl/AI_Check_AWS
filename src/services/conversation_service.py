@@ -447,10 +447,10 @@ class ConversationService:
 
         Example:
             >>> ConversationService._default_subject_line("X200", "chinese")
-            '询价请求 — X200'
+            'Request for Quotation — X200'
         """
         if (supplier_type or "").strip().lower() == "chinese":
-            base = "询价请求"
+            base = "Request for Quotation"
         else:
             base = "Request for Quotation"
         return f"{base} — {product_name}" if product_name else base
