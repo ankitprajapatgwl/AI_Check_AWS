@@ -202,7 +202,7 @@
     <li>Filling in the supplier and product creates the conversation as a <strong>draft</strong> and assigns its reference — before anything is sent.</li>
     <li>The RFQ goes out with the subject <code style="background:var(--bg);padding:1px 5px;border-radius:3px;">[RFQ - id] - …</code> and its own <code style="background:var(--bg);padding:1px 5px;border-radius:3px;">Message-ID</code>; the draft becomes <strong>Open</strong>.</li>
     <li>A reply is matched by <code style="background:var(--bg);padding:1px 5px;border-radius:3px;">In-Reply-To</code>/<code style="background:var(--bg);padding:1px 5px;border-radius:3px;">References</code>, falling back to the <code style="background:var(--bg);padding:1px 5px;border-radius:3px;">[RFQ - id]</code> subject prefix — so keeping the subject intact is all a supplier has to do. The conversation then becomes <strong>Closed</strong>.</li>
-    <li>Replies reach us at <code style="background:var(--bg);padding:1px 5px;border-radius:3px;">/webhooks/inbound/{provider}</code>, except Alibaba's, which are polled over IMAP.</li>
+    <li>Replies reach us at <code style="background:var(--bg);padding:1px 5px;border-radius:3px;">/webhooks/rfq/inbound</code>, except Alibaba's, which are polled over IMAP.</li>
     <li>View the full conversation thread on the <a href="{{ base_path }}/tracking">Tracking</a> page.</li>
   </ol>
 </div>

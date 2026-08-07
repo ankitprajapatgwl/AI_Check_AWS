@@ -12,8 +12,9 @@ Alibaba reply exactly like a webhook-delivered one.
 It still subclasses :class:`WebhookParserMaster` and registers in
 :mod:`src.webhook_factory.factory` so the factory stays uniform (and so it
 inherits the attachment persistence and MIME helpers). Its :meth:`parse`
-deliberately raises — reaching it means something POSTed to
-``/webhooks/inbound/alibaba``, which Alibaba never does.
+deliberately raises — reaching it means an HTTP POST to
+``/webhooks/rfq/inbound`` was resolved to Alibaba, which cannot happen for
+real Alibaba mail (it arrives over IMAP, never as a webhook).
 
 Example:
     >>> import email

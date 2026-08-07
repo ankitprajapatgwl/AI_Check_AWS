@@ -1,7 +1,7 @@
 """Inbound webhook parser for EngageLab.
 
 EngageLab's Inbound Route posts a supplier reply to our
-``POST /webhooks/inbound`` endpoint once the MX record for
+``POST /webhooks/rfq/inbound`` endpoint once the MX record for
 ``ENGAGELAB_OUTBOUND_DOMAIN`` points at EngageLab and a webhook is bound to
 the sending API_USER.
 

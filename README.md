@@ -229,18 +229,24 @@ obvious at a glance.
 Re-delivering the same message (a webhook retry, an IMAP re-poll) is a no-op
 — `emails.message_id` is `UNIQUE` and is checked before insert.
 
-### Inbound URLs
+### Inbound URL
 
-Point each provider's inbound webhook at **its own** path:
+There is one inbound URL. Point every provider's inbound webhook at it:
 
 ```
-/email_poc/webhooks/inbound/{provider}
+/email_poc/webhooks/rfq/inbound
 ```
 
-e.g. `/email_poc/webhooks/inbound/engagelab`,
-`/email_poc/webhooks/inbound/sendcloud`. The un-suffixed
-`/email_poc/webhooks/inbound` still works and resolves to the default
-provider (EngageLab), so dashboards configured earlier keep delivering.
+No provider names itself — EngageLab's WebHook field and SendCloud/Aurora's
+Inbound Route just re-post to the URL string you typed, and neither can
+append a path segment — so the app works out who posted from the payload's
+own shape (see `_resolve_inbound_provider` in [`src/route.py`](src/route.py)).
+
+One case that shape can't settle: SendCloud's payload is undocumented and
+this repo's parser mirrors SendGrid's field names exactly. Configure
+SendCloud with the optional override
+`/email_poc/webhooks/rfq/inbound?provider=sendcloud`; every other provider
+uses the bare URL.
 
 **Alibaba is the exception**: it has no inbound webhook, so its replies are
 polled over IMAP by a background task instead — see

@@ -519,8 +519,9 @@ class ConversationService:
 
         Args:
             request (Request): The FastAPI request for the inbound POST.
-            provider_key (str): Which provider posted, taken from the URL —
-                ``POST /webhooks/inbound/{provider_key}``.
+            provider_key (str): Which provider posted, as resolved by the
+                route (``src.route._resolve_inbound_provider``) — the
+                providers themselves send no identifier.
 
         Returns:
             dict: A status payload — one of ``{"status": "error"}``,

@@ -1,6 +1,6 @@
 """Inbound webhook parser for Mailgun Routes (inbound forwarding).
 
-A Mailgun *route* with a ``forward("https://.../webhooks/inbound")`` action
+A Mailgun *route* with a ``forward("https://.../webhooks/rfq/inbound")`` action
 POSTs the parsed message as ``multipart/form-data``. This parser converts
 that payload into a normalised :class:`InboundEmail` and verifies the
 request's authenticity with Mailgun's HMAC signature scheme.

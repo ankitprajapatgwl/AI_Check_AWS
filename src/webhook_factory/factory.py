@@ -2,7 +2,8 @@
 
 :class:`WebhookParserFactory` maps a provider key to the matching
 :class:`~src.webhook_factory.webhook_master.WebhookParserMaster` subclass so
-``POST /webhooks/inbound/{provider_key}`` can decode that provider's payload.
+``POST /webhooks/rfq/inbound`` can decode whichever provider's payload
+arrived.
 Parsers are now built (and cached) per provider on demand by
 :meth:`~src.services.conversation_service.ConversationService.get_parser`,
 so every provider's inbound mail is understood — not just the one that used
@@ -37,7 +38,7 @@ from src.webhook_factory.webhook_master import WebhookParserMaster
 # keys identical to those in the email-provider factory so the same
 # provider key can build either a send-side or receive-side instance — the
 # service resolves a parser per inbound request now (see
-# ``POST /webhooks/inbound/{provider_key}``), not once at startup.
+# ``POST /webhooks/rfq/inbound``), not once at startup.
 #
 # NOTE: "sendcloud"'s inbound payload shape is a best-effort guess (no
 # SendCloud inbound webhook doc available yet). "alibaba"/"alibaba_hk" map to

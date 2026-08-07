@@ -3,7 +3,7 @@
 Every email provider posts inbound mail to this app in a slightly different
 shape — SendGrid and Mailgun use ``multipart/form-data`` with different
 field names, and Elastic Email can post form or JSON. To keep the single
-``POST /webhooks/inbound`` route provider-agnostic, each provider has a
+``POST /webhooks/rfq/inbound`` route provider-agnostic, each provider has a
 parser that converts its native payload into one normalised
 :class:`InboundEmail` object.
 

@@ -11,7 +11,8 @@ ready-to-serve :data:`app` object that Uvicorn imports
    (:data:`_INBOUND_EMAIL_PROVIDER`) via their factories. Neither sending
    nor receiving is pinned to that one provider anymore: the sender picks a
    provider per send on the Send RFQ form, inbound arrives at
-   ``POST /webhooks/inbound/{provider}``, and
+   ``POST /webhooks/rfq/inbound`` (which works out which provider
+   posted), and
    :class:`~src.services.conversation_service.ConversationService` builds
    and caches the rest on demand.
 5. Assemble the :class:`ConversationService`.
@@ -67,10 +68,10 @@ from app import router as bedrock_router  # noqa: E402
 
 # Default provider, used for two things only:
 #
-# 1. Which parser the legacy un-suffixed ``POST /webhooks/inbound`` path
-#    falls back to, so provider dashboards configured before the
-#    per-provider ``/webhooks/inbound/{provider}`` routes existed keep
-#    working (see src/route.py::_DEFAULT_INBOUND_PROVIDER).
+# 1. Which parser ``POST /webhooks/rfq/inbound`` falls back to when neither
+#    the URL nor the payload names a provider — no provider identifies
+#    itself on an inbound POST (see src/route.py::_DEFAULT_INBOUND_PROVIDER
+#    and _resolve_inbound_provider).
 # 2. Eager credential validation at startup, so a misconfigured default
 #    fails fast rather than on the first request.
 #
@@ -101,7 +102,7 @@ def create_app() -> FastAPI:
 
     Example:
         >>> app = create_app()           # doctest: +SKIP
-        >>> "/webhooks/inbound" in {r.path for r in app.routes}  # noqa
+        >>> "/webhooks/rfq/inbound" in {r.path for r in app.routes}  # noqa
         True
     """
     settings = get_settings()
@@ -136,7 +137,7 @@ def create_app() -> FastAPI:
         """Run the Alibaba IMAP pollers for the lifetime of the app.
 
         Every other provider pushes inbound mail to
-        ``POST /webhooks/inbound/{provider}``; Alibaba has no such hook, so
+        ``POST /webhooks/rfq/inbound``; Alibaba has no such hook, so
         its replies are pulled by a background task per configured region
         (see src/inbound/alibaba_imap_poller.py). Both feed the same
         ConversationService.process_inbound pipeline.

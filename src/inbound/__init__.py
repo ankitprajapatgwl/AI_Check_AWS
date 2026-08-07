@@ -1,6 +1,6 @@
 """Non-webhook inbound sources.
 
-Most providers push inbound mail to ``POST /webhooks/inbound/{provider}``.
+Most providers push inbound mail to ``POST /webhooks/rfq/inbound``.
 Alibaba Enterprise Mail has no such hook, so this package holds the polling
 counterpart — see :mod:`src.inbound.alibaba_imap_poller`. Everything here
 feeds the exact same

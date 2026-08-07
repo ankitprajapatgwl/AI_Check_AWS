@@ -359,7 +359,8 @@ class Settings:
         Every provider has its own domain — ``ENGAGELAB_OUTBOUND_DOMAIN``,
         ``SENDCLOUD_OUTBOUND_DOMAIN``, ``ALIBABA_OUTBOUND_DOMAIN``, … — and
         since this rework they are genuinely independent: inbound is
-        per-provider (``POST /webhooks/inbound/{provider}`` plus Alibaba's
+        per-provider (``POST /webhooks/rfq/inbound`` resolves the posting
+        provider per request, plus Alibaba's
         IMAP poller) and matching no longer parses the recipient address at
         all, so there is no reason to keep them equal.
 

@@ -3,7 +3,7 @@
 This package implements the *strategy + factory* pattern for the single
 inbound webhook. Every provider posts received mail in a different shape;
 each parser normalises that into one :class:`InboundEmail` so the
-``POST /webhooks/inbound`` route and the service layer stay
+``POST /webhooks/rfq/inbound`` route and the service layer stay
 provider-agnostic.
 
 - :mod:`src.webhook_factory.webhook_master` defines
@@ -15,10 +15,11 @@ provider-agnostic.
   :mod:`src.webhook_factory.elasticemail_webhook` are the concrete parsers.
 - :mod:`src.webhook_factory.factory` exposes
   :class:`WebhookParserFactory`, which returns the parser for a given
-  provider key — the app builds exactly one at startup
-  (``src.app._INBOUND_EMAIL_PROVIDER``) since ``POST /webhooks/inbound``
-  only understands one payload format at a time, independent of which
-  provider a sender picks per outbound send.
+  provider key. One is built eagerly at startup
+  (``src.app._INBOUND_EMAIL_PROVIDER``) to validate its credentials; the
+  rest are built on demand, because ``POST /webhooks/rfq/inbound`` resolves
+  the posting provider per request (see
+  :meth:`~src.services.conversation_service.ConversationService.get_parser`).
 
 Import the factory (not the concrete parsers):
 

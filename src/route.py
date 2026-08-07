@@ -22,9 +22,10 @@ Method + path                   Purpose
 ``GET /tracking``               Personal dashboard: my stats + conversations.
 ``GET /tracking/{c}``           Full conversation thread (ownership-checked).
 ``POST /tracking/{c}/delete``   Delete one of my conversations.
-``POST /webhooks/inbound/{p}``  Receive an inbound reply from provider ``p``.
-``GET /webhooks/inbound/{p}``   Validation probe (Elastic Email GETs this).
-``POST|GET /webhooks/inbound``  Legacy aliases for the default provider.
+``POST /webhooks/rfq/inbound``  Receive an inbound reply from any provider;
+                                which one is resolved from the request (see
+                                :func:`_resolve_inbound_provider`).
+``GET /webhooks/rfq/inbound``   Validation probe (Elastic Email GETs this).
 =============================== ==============================================
 
 Example:
@@ -34,6 +35,7 @@ Example:
     >>> app.include_router(router)            # doctest: +SKIP
 """
 
+import json
 from typing import List
 from urllib.parse import quote
 
@@ -112,10 +114,34 @@ _SEND_KEY_HINTS = {
     "alibaba_hk": "Alibaba Hong Kong server",
 }
 
-# Which parser the legacy un-suffixed /webhooks/inbound path uses. Kept so
-# provider dashboards configured before the per-provider routes existed keep
-# delivering; new configurations should point at
-# /webhooks/inbound/{provider}.
+# ── Inbound webhook URL ──────────────────────────────────────────────
+#
+# ONE inbound URL, with no provider segment in it. No email provider
+# identifies itself on an inbound POST: EngageLab and SendCloud/Aurora both
+# simply re-post the reply to whatever URL string was typed into their
+# dashboard's WebHook / Inbound Route field, with no provider name, header
+# or body field of their own, and neither dashboard can append a path
+# segment (SendGrid, Mailgun and Elastic Email behave the same way; Alibaba
+# has no webhook at all and is polled over IMAP instead). A
+# ``/{provider_key}`` route would therefore only ever 404 — see
+# setup_docs/engagelab_guide/Engagelab_Documentation.md §6 and
+# setup_docs/aurora_send_cloud/AuroraSendCloud_Documentation.md §8, which
+# both configure exactly this path.
+
+
+# Body markers that name the provider that posted, checked by
+# _resolve_inbound_provider. Only unambiguous ones are listed: SendGrid and
+# SendCloud are deliberately absent because SendCloud's real payload shape
+# is undocumented and this repo's parser mirrors SendGrid's field names
+# exactly (see src/webhook_factory/sendcloud_webhook.py), so nothing in the
+# body tells those two apart — they need the optional ?provider= override.
+_MAILGUN_SIGNATURE_KEYS = ("signature", "token", "timestamp")
+_MAILGUN_BODY_KEYS = ("body-plain", "body-html", "message-headers")
+_ELASTICEMAIL_KEYS = ("from_email", "body_text", "header_list")
+
+# Last-resort parser for a POST that named no provider and matched no
+# marker. EngageLab is the default because its Inbound Route is the one
+# pointed at the bare URL today.
 _DEFAULT_INBOUND_PROVIDER = "engagelab"
 
 
@@ -664,23 +690,96 @@ async def delete_conversation(
     return RedirectResponse(f"{BASE_PATH}/tracking?deleted=1", status_code=303)
 
 
-# ── Inbound webhooks (one URL per provider) ──────────────────────────
+# ── Inbound webhook ──────────────────────────────────────────────────
+async def _resolve_inbound_provider(request: Request) -> str:
+    """Work out which provider posted an inbound reply.
+
+    Needed because no provider names itself (see :data:`"/webhooks/rfq/inbound"`) —
+    yet no single parser can decode every payload format, so
+    :meth:`ConversationService.get_parser` still has to be given a key.
+    Sources are tried in descending order of reliability:
+
+    1. An optional ``?provider=`` (or ``?provider_key=``) query parameter.
+       Nothing requires it — it is a manual override that wins over the
+       guess below, for a payload no marker can identify.
+    2. The payload's own shape — EngageLab's nested
+       ``response.response_data`` envelope, Mailgun's signature triple or
+       ``body-plain``/``body-html``, Elastic Email's
+       ``from_email``/``body_text``/``header_list``.
+    3. :data:`_DEFAULT_INBOUND_PROVIDER`.
+
+    SendCloud and SendGrid are not detectable by shape (see
+    :data:`_MAILGUN_SIGNATURE_KEYS` and the comment above it), so SendCloud
+    is the one provider that needs the ``?provider=sendcloud`` override.
+
+    The body is read here, before the parser runs. Starlette lets the
+    request stream be consumed only once but caches it on the request, so
+    the parser's later ``request.json()`` / ``request.form()`` call is
+    served from that cache rather than an exhausted stream.
+
+    Args:
+        request (Request): The inbound POST.
+
+    Returns:
+        str: A provider key to hand to
+            :meth:`ConversationService.get_parser`.
+    """
+    explicit = (
+        request.query_params.get("provider")
+        or request.query_params.get("provider_key")
+        or ""
+    ).strip().lower()
+    if explicit:
+        return explicit
+
+    try:
+        raw = await request.body()
+        if not raw:
+            return _DEFAULT_INBOUND_PROVIDER
+
+        if "application/json" in request.headers.get("content-type", ""):
+            payload = json.loads(raw)
+            response = (
+                payload.get("response") if isinstance(payload, dict) else None
+            )
+            if isinstance(response, dict) and (
+                response.get("event") == "route" or "response_data" in response
+            ):
+                return "engagelab"
+            return _DEFAULT_INBOUND_PROVIDER
+
+        form = await request.form()
+        if all(key in form for key in _MAILGUN_SIGNATURE_KEYS):
+            return "mailgun"
+        if any(key in form for key in _MAILGUN_BODY_KEYS):
+            return "mailgun"
+        if all(key in form for key in _ELASTICEMAIL_KEYS):
+            return "elasticemail"
+        if "response" in form:
+            return "engagelab"
+    except Exception:  # noqa: BLE001 - a failed guess must not fail the POST
+        return _DEFAULT_INBOUND_PROVIDER
+
+    return _DEFAULT_INBOUND_PROVIDER
 
 
-@router.post("/webhooks/inbound/{provider_key}")
-async def handle_inbound_email_for(request: Request, provider_key: str):
-    """Receive and process one inbound email from a specific provider.
+@router.post("/webhooks/rfq/inbound")
+async def handle_inbound_email(request: Request):
+    """Receive and process one inbound email — the only inbound URL.
 
-    Inbound has to work for every provider, and no single parser can decode
-    every payload format — so the provider is named in the URL and the
-    matching parser is resolved per request (see
-    :meth:`ConversationService.get_parser`). Point each provider's dashboard
-    at its own path, e.g.
-    ``/email_poc/webhooks/inbound/engagelab``.
+    This is the endpoint to enter in a provider dashboard::
+
+        https://<host>/email_poc/webhooks/rfq/inbound
+
+    There is no provider segment in the path, because no provider puts one
+    there: EngageLab's WebHook field and SendCloud/Aurora's Inbound Route
+    both POST to this exact string and nothing more. Which parser to use is
+    worked out per request by :func:`_resolve_inbound_provider` and resolved
+    through :meth:`ConversationService.get_parser`.
 
     Alibaba has no inbound webhook at all: its replies arrive through the
     IMAP poller (see :mod:`src.inbound.alibaba_imap_poller`) and feed the
-    same pipeline, so posting here as ``alibaba`` returns an error.
+    same pipeline.
 
     Parsing, conversation matching, attachment storage and reply
     classification all happen inside
@@ -690,7 +789,6 @@ async def handle_inbound_email_for(request: Request, provider_key: str):
     Args:
         request (Request): FastAPI request. The body is form or JSON data
             depending on the provider.
-        provider_key (str): Which provider is posting, e.g. ``"engagelab"``.
 
     Returns:
         JSONResponse: The status payload from
@@ -700,52 +798,23 @@ async def handle_inbound_email_for(request: Request, provider_key: str):
             (see :data:`_INBOUND_STATUS_CODES`).
     """
     service: ConversationService = request.app.state.service
+    provider_key = await _resolve_inbound_provider(request)
+    request.app.state.log.info(
+        "Inbound POST resolved to provider '%s'", provider_key
+    )
     result = await service.handle_inbound(request, provider_key)
     status_code = _INBOUND_STATUS_CODES.get(result.get("status"), 200)
     return JSONResponse(content=result, status_code=status_code)
 
 
-@router.get("/webhooks/inbound/{provider_key}")
-async def validate_inbound_webhook_for(provider_key: str):
+@router.get("/webhooks/rfq/inbound")
+async def validate_inbound_webhook():
     """Answer the GET probe some providers send before saving a route.
 
     Elastic Email (and others) validate an inbound notification URL by
     issuing a ``GET`` and requiring a ``2xx`` response before they will save
     it. This handler exists solely to satisfy that probe. Deliberately
     public, same reasoning as the POST variant above.
-
-    Args:
-        provider_key (str): The provider path segment being validated.
-
-    Returns:
-        dict: ``{"status": "ok", "provider": provider_key}`` with an
-            implicit ``200`` status.
-    """
-    return {"status": "ok", "provider": provider_key}
-
-
-# ── Legacy aliases ───────────────────────────────────────────────────
-# Kept so provider dashboards configured against the old single-URL
-# endpoint keep delivering; they resolve to _DEFAULT_INBOUND_PROVIDER.
-# New configurations should use /webhooks/inbound/{provider}.
-
-
-@router.post("/webhooks/inbound")
-async def handle_inbound_email(request: Request):
-    """Legacy inbound endpoint — routes to the default provider's parser.
-
-    Args:
-        request (Request): FastAPI request.
-
-    Returns:
-        JSONResponse: Same as :func:`handle_inbound_email_for`.
-    """
-    return await handle_inbound_email_for(request, _DEFAULT_INBOUND_PROVIDER)
-
-
-@router.get("/webhooks/inbound")
-async def validate_inbound_webhook():
-    """Legacy validation probe for the un-suffixed inbound path.
 
     Returns:
         dict: ``{"status": "ok"}`` with an implicit ``200`` status.
