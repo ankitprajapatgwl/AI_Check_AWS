@@ -21,17 +21,22 @@ Two consequences worth knowing before reading the code:
    :meth:`~src.services.conversation_service.ConversationService.send_rfq`
    does for every provider.
 
-Two regions are registered, matching how the rest of the app splits Chinese
-from non-Chinese suppliers:
+Two regions are registered, but **only Hong Kong is used for sending**:
 
 ================================ ========================================
 Class / factory key              Region
 ================================ ========================================
 ``AlibabaEnterpriseProvider``    Singapore — ``smtp.qiye.aliyun.com``
-(``"alibaba"``)                  (non-Chinese suppliers)
+(``"alibaba"``)                  (not routed to; base class for the below)
 ``AlibabaHKEnterpriseProvider``  Hong Kong — ``smtphk.qiye.aliyun.com``
-(``"alibaba_hk"``)               (Chinese suppliers)
+(``"alibaba_hk"``)               (**both** supplier types)
 ================================ ========================================
+
+``src.route._SEND_KEYS`` resolves Alibaba + *either* supplier type to
+``"alibaba_hk"``: one endpoint, one mailbox, one SMTP route, one place for
+replies to land. The Singapore class stays registered because the Hong Kong
+one subclasses it, historical conversations recorded ``send_key='alibaba'``,
+and re-splitting the two is a one-line change in that table.
 
 Configuration consumed (see :class:`src.config.Settings` and
 ``setup_docs/alibaba_guide/Alibaba_Documentation.md``):
@@ -86,8 +91,9 @@ _SMTP_OK = 250
 class AlibabaEnterpriseProvider(EmailMaster):
     """Send RFQ emails through Alibaba Enterprise Mail over SMTP+SSL.
 
-    Singapore region by default; :class:`AlibabaHKEnterpriseProvider` pins
-    Hong Kong. Sends from the single authenticated mailbox
+    Singapore region. Nothing routes here anymore — every Alibaba send goes
+    through :class:`AlibabaHKEnterpriseProvider`, which subclasses this and
+    pins Hong Kong. Sends from the single authenticated mailbox
     (``ALIBABA_MAIL_ADDRESS``); the per-user identity lives in the display
     name, since Alibaba SMTP rejects a ``From`` that is not the
     authenticated account.
@@ -314,10 +320,12 @@ class AlibabaHKEnterpriseProvider(AlibabaEnterpriseProvider):
     """Alibaba Enterprise Mail, pinned to the Hong Kong region.
 
     Registered under the separate factory key ``"alibaba_hk"`` (see
-    :mod:`src.email_platform.factory`) and selected internally by
-    :mod:`src.route` when the sender picks Alibaba for a Chinese supplier —
-    Hong Kong's ``smtphk.qiye.aliyun.com`` sits closer to Chinese mailboxes
-    than the Singapore endpoint. Everything about sending is identical to
+    :mod:`src.email_platform.factory`) and selected by :mod:`src.route`
+    whenever the sender picks Alibaba — for **either** supplier type. Hong
+    Kong's ``smtphk.qiye.aliyun.com`` sits closer to Chinese mailboxes than
+    the Singapore endpoint and serves the rest just as well, so routing
+    everything through it keeps one mailbox and one reply path.
+    Everything about sending is identical to
     :class:`AlibabaEnterpriseProvider`; only the hosts, credentials and
     outbound domain differ, and each ``ALIBABA_HK_*`` value falls back to its
     Singapore counterpart so one mailbox can serve both regions.

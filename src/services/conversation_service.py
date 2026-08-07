@@ -39,8 +39,9 @@ There is no dynamic per-conversation reply address anywhere in this flow.
 
 Provider selection is per send: the Send RFQ form has a "Provider" dropdown
 plus a "Supplier Type" (Chinese / Non-Chinese), and the route layer resolves
-that pair to a factory key — SendCloud + Chinese → ``sendcloud_hk``, Alibaba
-+ Chinese → ``alibaba_hk``, and so on (see ``src.route._SEND_KEYS``).
+that pair to a factory key — SendCloud + Chinese → ``sendcloud_hk``, while
+Alibaba resolves to ``alibaba_hk`` for *both* supplier types (its Hong Kong
+server sends everything) — see ``src.route._SEND_KEYS``.
 :meth:`ConversationService.get_provider` and
 :meth:`ConversationService.get_parser` build and cache an instance per key on
 demand, so adding a provider needs no changes here.

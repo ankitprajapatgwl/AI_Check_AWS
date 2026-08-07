@@ -51,7 +51,7 @@
                   {% endif %}
                 {% endfor %}
               </select>
-              <span class="label-hint">SendCloud/EngageLab/Alibaba support Chinese and Non-Chinese suppliers — Chinese routes through the provider's Hong Kong region</span>
+              <span class="label-hint">SendCloud/EngageLab/Alibaba support Chinese and Non-Chinese suppliers — SendCloud routes Chinese through its Hong Kong region, Alibaba sends both through Hong Kong</span>
             </div>
           </div>
         </div>
@@ -198,7 +198,7 @@
 <div style="margin-top: 24px; padding: 16px 20px; background: var(--card); border: 1px solid var(--border); border-radius: var(--r);">
   <div style="font-size: 13px; font-weight: 600; margin-bottom: 8px; color: var(--txt2);">How it works</div>
   <ol style="padding-left: 18px; font-size: 13px; color: var(--txt2); line-height: 1.8;">
-    <li>Pick the email provider to send through, and the supplier's type (Chinese / Non-Chinese) — SendCloud, EngageLab and Alibaba all support both, with Chinese suppliers routed through the provider's Hong Kong region.</li>
+    <li>Pick the email provider to send through, and the supplier's type (Chinese / Non-Chinese) — SendCloud, EngageLab and Alibaba all support both. SendCloud routes Chinese suppliers through its Hong Kong region; Alibaba sends both supplier types through its Hong Kong server.</li>
     <li>Filling in the supplier and product creates the conversation as a <strong>draft</strong> and assigns its reference — before anything is sent.</li>
     <li>The RFQ goes out with the subject <code style="background:var(--bg);padding:1px 5px;border-radius:3px;">[RFQ - id] - …</code> and its own <code style="background:var(--bg);padding:1px 5px;border-radius:3px;">Message-ID</code>; the draft becomes <strong>Open</strong>.</li>
     <li>A reply is matched by <code style="background:var(--bg);padding:1px 5px;border-radius:3px;">In-Reply-To</code>/<code style="background:var(--bg);padding:1px 5px;border-radius:3px;">References</code>, falling back to the <code style="background:var(--bg);padding:1px 5px;border-radius:3px;">[RFQ - id]</code> subject prefix — so keeping the subject intact is all a supplier has to do. The conversation then becomes <strong>Closed</strong>.</li>
