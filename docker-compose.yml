@@ -29,6 +29,14 @@ services:
       context: .
       dockerfile: Dockerfile
     restart: unless-stopped
+    # Run as the host user that owns ./data, NOT as root. The bind mount
+    # below is the same directory the app writes inbound attachments into,
+    # and a root-owned container creates ./data/attachments as root:root on
+    # the host — after which running the app locally (uv/uvicorn, uid 1000)
+    # fails every attachment write with "[Errno 13] Permission denied" and
+    # silently drops the files. Override with APP_UID/APP_GID in .env if the
+    # host account is not uid/gid 1000 (check with `id -u` / `id -g`).
+    user: "${APP_UID:-1000}:${APP_GID:-1000}"
     env_file:
       - .env
     ports:

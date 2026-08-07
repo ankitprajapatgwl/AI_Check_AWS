@@ -150,6 +150,17 @@ class Settings:
         # ── Global settings ──────────────────────────────────────────
         self.log_level = os.getenv("LOG_LEVEL", "INFO").strip().upper()
 
+        # Which inbound parser POST /webhooks/rfq/inbound falls back to when
+        # neither ?provider= nor the payload's own shape identifies the
+        # sender. Blank keeps src.route._DEFAULT_INBOUND_PROVIDER. Only
+        # matters for a provider with no distinguishing marker — EngageLab,
+        # Mailgun, Elastic Email and SendGrid are all detected by shape, so
+        # this is effectively "which of the remaining providers owns the
+        # bare webhook URL".
+        self.inbound_default_provider = (
+            os.getenv("INBOUND_DEFAULT_PROVIDER", "").strip().lower()
+        )
+
         # ── SendGrid credentials ─────────────────────────────────────
         self.sendgrid_api_key = os.getenv("SENDGRID_API_KEY")
 

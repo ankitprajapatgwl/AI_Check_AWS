@@ -30,6 +30,7 @@ Example:
 """
 
 import asyncio
+import os
 import sys
 import time
 import uuid
@@ -81,6 +82,60 @@ from app import router as bedrock_router  # noqa: E402
 _INBOUND_EMAIL_PROVIDER = "engagelab"
 
 
+def _check_attachments_writable(settings, logger) -> bool:
+    """Verify the process can actually write into the attachments directory.
+
+    ``mkdir(exist_ok=True)`` succeeds on a directory this process may not
+    write to, so existence alone proves nothing. Every inbound attachment
+    write is deliberately non-fatal
+    (:meth:`~src.webhook_factory.webhook_master.WebhookParserMaster.persist_attachments`
+    logs and skips, so one bad file cannot lose a whole reply) — which means
+    a permanently unwritable directory shows up only as a per-file error
+    buried in the log while the UI silently shows "no attachments". This
+    probe surfaces that at boot instead, with the fix in the message.
+
+    The common cause is Docker: ``docker-compose.yml`` bind-mounts ``./data``
+    and, if the container runs as root, it creates ``data/attachments`` as
+    ``root:root`` on the host — after which running the app locally as a
+    normal user fails every write with ``EACCES``.
+
+    Args:
+        settings (Settings): Application configuration, for
+            ``attachments_dir``.
+        logger (logging.Logger): Shared application logger.
+
+    Returns:
+        bool: ``True`` when a test file could be created and removed,
+            ``False`` otherwise (already logged as an error).
+    """
+    directory = settings.attachments_dir
+    probe = directory / ".write_probe"
+    try:
+        probe.touch()
+        probe.unlink()
+    except OSError as exc:
+        try:
+            stat = directory.stat()
+            owner = f"uid={stat.st_uid} gid={stat.st_gid} mode={oct(stat.st_mode & 0o777)}"
+        except OSError:
+            owner = "unknown"
+        logger.error(
+            "Attachments directory %s is NOT writable (%s). Inbound "
+            "attachments will be dropped and the UI will show none. "
+            "Directory is %s; this process runs as uid=%s gid=%s. Fix with: "
+            "sudo chown -R $(id -u):$(id -g) %s",
+            directory,
+            exc,
+            owner,
+            os.getuid() if hasattr(os, "getuid") else "n/a",
+            os.getgid() if hasattr(os, "getgid") else "n/a",
+            settings.data_dir,
+        )
+        return False
+    logger.debug("Attachments directory %s is writable", directory)
+    return True
+
+
 def create_app() -> FastAPI:
     """Build, wire and return the FastAPI application.
 
@@ -118,6 +173,7 @@ def create_app() -> FastAPI:
     # 2. Ensure the directories the app reads/writes/serves all exist.
     settings.attachments_dir.mkdir(parents=True, exist_ok=True)
     settings.static_dir.mkdir(parents=True, exist_ok=True)
+    _check_attachments_writable(settings, logger)
 
     # 3. Build infrastructure + the default provider/parser pair.
     engine, session_factory = create_engine_and_sessionmaker(settings.database_url)

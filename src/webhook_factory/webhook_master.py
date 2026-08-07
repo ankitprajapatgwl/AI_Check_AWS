@@ -28,7 +28,9 @@ Example:
     'sendgrid'
 """
 
+import errno
 import logging
+import os
 import re
 import uuid
 from abc import ABC, abstractmethod
@@ -307,10 +309,27 @@ class WebhookParserMaster(ABC):
                     handle.write(att.content)
             except OSError as exc:
                 # A single bad attachment must not abort the whole reply;
-                # log it and keep processing the others.
-                self.log.error(
-                    "Failed to save attachment %s: %s", safe_name, exc
-                )
+                # log it and keep processing the others. EACCES is called out
+                # separately because it is never a per-file problem — the
+                # whole directory is unwritable (typically because a
+                # root-running container created data/attachments on the host
+                # bind mount) and every attachment from here on will be lost
+                # the same way, showing up in the UI as "no attachments".
+                if exc.errno == errno.EACCES:
+                    self.log.error(
+                        "Cannot write attachment %s: %s is not writable by "
+                        "this process (uid=%s). Every inbound attachment is "
+                        "being dropped. Fix with: "
+                        "sudo chown -R $(id -u):$(id -g) %s",
+                        safe_name,
+                        directory,
+                        getattr(os, "getuid", lambda: "n/a")(),
+                        directory.parent,
+                    )
+                else:
+                    self.log.error(
+                        "Failed to save attachment %s: %s", safe_name, exc
+                    )
                 continue
             saved.append({
                 "filename": att.filename,

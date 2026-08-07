@@ -129,20 +129,66 @@ _SEND_KEY_HINTS = {
 # both configure exactly this path.
 
 
-# Body markers that name the provider that posted, checked by
-# _resolve_inbound_provider. Only unambiguous ones are listed: SendGrid and
-# SendCloud are deliberately absent because SendCloud's real payload shape
-# is undocumented and this repo's parser mirrors SendGrid's field names
-# exactly (see src/webhook_factory/sendcloud_webhook.py), so nothing in the
-# body tells those two apart — they need the optional ?provider= override.
-_MAILGUN_SIGNATURE_KEYS = ("signature", "token", "timestamp")
-_MAILGUN_BODY_KEYS = ("body-plain", "body-html", "message-headers")
-_ELASTICEMAIL_KEYS = ("from_email", "body_text", "header_list")
+# ── Inbound provider detection ───────────────────────────────────────
+#
+# Only TWO providers post to this endpoint: EngageLab and AuroraSendCloud.
+# Alibaba Enterprise Mail is the third provider in use but has no inbound
+# webhook at all — its replies are pulled over IMAP
+# (src/inbound/alibaba_imap_poller.py) and never reach this route. SendGrid,
+# Mailgun and Elastic Email are not used for inbound; their parsers stay
+# registered in WebhookParserFactory and remain reachable with an explicit
+# ?provider=, but they are deliberately NOT auto-detected here.
+#
+# They used to be, and it broke SendCloud badly. A real captured SendCloud
+# payload posts `signature`, `token` and `timestamp` (its own webhook
+# signature triple) — byte-for-byte the marker that used to be treated as
+# proof of Mailgun. Every SendCloud reply was therefore handed to the
+# Mailgun parser, which looks for `sender`/`recipient`/`body-plain`, found
+# none of them, and returned an InboundEmail with an empty sender,
+# recipient, Message-ID and no attachments. The request arrived, logged 200,
+# and parsed to nothing. Heuristics for providers nobody uses can only cost
+# accuracy, so the detection below covers exactly the two live ones.
+#
+# Confirmed SendCloud Inbound Route payload (application/x-www-form-urlencoded,
+# 22 fields), captured 2026-08-07 from a live supplier reply:
+#
+#   event, emailId, reference, labelId, labelName, timestamp,
+#   signature, token, message,
+#   from, fromname, to, toname, subject, text, html,
+#   headers, userHeaders, raw_message, raw_message_url,
+#   x_mx_rcptto, x_mx_mailfrom
+#
+# That is the same field vocabulary as EngageLab's — both platforms share
+# the same inbound engine — so the two cannot be told apart by field names.
+# The real discriminator is SHAPE: EngageLab wraps everything in a nested
+# `response.response_data` JSON envelope, SendCloud posts the identical
+# fields flat as urlencoded form data.
+_ENGAGELAB_ENVELOPE_KEY = "response"
+
+# Fields unique to the Aurora/SendCloud inbound engine at the TOP level.
+# Any one of them on a flat payload identifies SendCloud; on an EngageLab
+# payload these same names appear nested inside response.response_data, and
+# the envelope check above runs first.
+_SENDCLOUD_KEYS = (
+    "x_mx_rcptto",
+    "x_mx_mailfrom",
+    "emailId",
+    "raw_message_url",
+)
+
+# The flat mail fields a non-EngageLab payload carries. Presence of any of
+# these proves the payload is NOT EngageLab's nested envelope — used only
+# for the diagnostic log line below.
+_FLAT_MAIL_KEYS = ("from", "to", "subject", "text", "html")
 
 # Last-resort parser for a POST that named no provider and matched no
-# marker. EngageLab is the default because its Inbound Route is the one
-# pointed at the bare URL today.
-_DEFAULT_INBOUND_PROVIDER = "engagelab"
+# marker. SendCloud, because EngageLab is the only other webhook provider
+# and it is positively identified by its envelope. Override per deployment
+# with INBOUND_DEFAULT_PROVIDER.
+_DEFAULT_INBOUND_PROVIDER = "sendcloud"
+
+# How much of a field value the inbound payload dump prints per field.
+_PAYLOAD_LOG_VALUE_CHARS = 120
 
 
 def _resolve_send_key(provider_name: str, supplier_type: str) -> str:
@@ -691,6 +737,87 @@ async def delete_conversation(
 
 
 # ── Inbound webhook ──────────────────────────────────────────────────
+def _fallback_inbound_provider(request: Request) -> str:
+    """Return the parser key to use when nothing identified the payload.
+
+    Args:
+        request (Request): The inbound POST, for ``app.state.settings``.
+
+    Returns:
+        str: ``INBOUND_DEFAULT_PROVIDER`` if configured, otherwise
+            :data:`_DEFAULT_INBOUND_PROVIDER`.
+    """
+    settings = getattr(request.app.state, "settings", None)
+    configured = getattr(settings, "inbound_default_provider", "") or ""
+    return configured.strip().lower() or _DEFAULT_INBOUND_PROVIDER
+
+
+def _log_inbound_payload(request: Request, raw: bytes, form, payload) -> None:
+    """Dump what an inbound POST actually contained, at INFO level.
+
+    A blank parse result is otherwise indistinguishable from a blank
+    request: the parsers read only the keys they expect and silently
+    produce empty strings for everything else, so "we got the webhook but
+    every field is empty" gives no clue whether the provider sent nothing or
+    sent field names this app does not read. Logging the real field names
+    (with truncated values, so bodies and attachments do not flood the log)
+    answers that from one live request.
+
+    This is the intended way to confirm SendCloud's undocumented Inbound
+    Route payload shape — see the note in
+    :mod:`src.webhook_factory.sendcloud_webhook`.
+
+    Args:
+        request (Request): The inbound POST.
+        raw (bytes): The raw request body.
+        form: The parsed form mapping, or ``None`` for a non-form body.
+        payload: The parsed JSON body, or ``None`` for a non-JSON body.
+
+    Returns:
+        None
+    """
+    log = request.app.state.log
+    content_type = request.headers.get("content-type", "-")
+
+    if form is not None:
+        fields = ", ".join(
+            f"{key}={_preview(form.get(key))}" for key in form.keys()
+        )
+        shape = f"form[{len(form.keys())} field(s)]: {fields}"
+    elif isinstance(payload, dict):
+        fields = ", ".join(
+            f"{key}={_preview(value)}" for key, value in payload.items()
+        )
+        shape = f"json[{len(payload)} key(s)]: {fields}"
+    else:
+        shape = f"unparsed body: {_preview(raw)}"
+
+    log.info(
+        "Inbound POST payload | content_type=%s | bytes=%d | %s",
+        content_type,
+        len(raw),
+        shape,
+    )
+
+
+def _preview(value) -> str:
+    """Shorten one payload value for the inbound payload dump.
+
+    Args:
+        value: Any form/JSON value — including an ``UploadFile``, whose
+            bytes must never be read into the log.
+
+    Returns:
+        str: A single-line, length-capped representation.
+    """
+    if hasattr(value, "filename") and hasattr(value, "read"):
+        return f"<file {value.filename!r}>"
+    text = str(value).replace("\n", "\\n").replace("\r", "")
+    if len(text) > _PAYLOAD_LOG_VALUE_CHARS:
+        return f"{text[:_PAYLOAD_LOG_VALUE_CHARS]}...(+{len(text) - _PAYLOAD_LOG_VALUE_CHARS} chars)"
+    return text
+
+
 async def _resolve_inbound_provider(request: Request) -> str:
     """Work out which provider posted an inbound reply.
 
@@ -701,21 +828,27 @@ async def _resolve_inbound_provider(request: Request) -> str:
 
     1. An optional ``?provider=`` (or ``?provider_key=``) query parameter.
        Nothing requires it — it is a manual override that wins over the
-       guess below, for a payload no marker can identify.
-    2. The payload's own shape — EngageLab's nested
-       ``response.response_data`` envelope, Mailgun's signature triple or
-       ``body-plain``/``body-html``, Elastic Email's
-       ``from_email``/``body_text``/``header_list``.
-    3. :data:`_DEFAULT_INBOUND_PROVIDER`.
+       detection below, and the only way to reach a parser for a provider
+       this app does not receive inbound mail from.
+    2. The payload's own shape. Only two providers post here (see the
+       comment above :data:`_ENGAGELAB_ENVELOPE_KEY`) and they share a field
+       vocabulary, so the test is structural, not name-based: a nested
+       ``response``/``response_data`` envelope is EngageLab, the same fields
+       flat are SendCloud.
+    3. :func:`_fallback_inbound_provider` — SendCloud by default.
 
-    SendCloud and SendGrid are not detectable by shape (see
-    :data:`_MAILGUN_SIGNATURE_KEYS` and the comment above it), so SendCloud
-    is the one provider that needs the ``?provider=sendcloud`` override.
+    Detection is deliberately limited to the providers actually in use.
+    Guessing at Mailgun/SendGrid/Elastic Email markers is what broke this
+    before: SendCloud's own ``signature``/``token``/``timestamp`` webhook
+    signature is identical to Mailgun's, so every SendCloud reply was parsed
+    by the Mailgun parser and came back with an empty sender, recipient and
+    Message-ID.
 
     The body is read here, before the parser runs. Starlette lets the
-    request stream be consumed only once but caches it on the request, so
-    the parser's later ``request.json()`` / ``request.form()`` call is
-    served from that cache rather than an exhausted stream.
+    request stream be consumed only once but caches it on the request
+    (``Request.body()`` stores ``_body``, and ``Request.stream()`` replays
+    it), so the parser's later ``request.json()`` / ``request.form()`` call
+    is served from that cache rather than an exhausted stream.
 
     Args:
         request (Request): The inbound POST.
@@ -729,38 +862,78 @@ async def _resolve_inbound_provider(request: Request) -> str:
         or request.query_params.get("provider_key")
         or ""
     ).strip().lower()
-    if explicit:
-        return explicit
 
+    raw = b""
+    form = None
+    payload = None
+    detected = None
     try:
         raw = await request.body()
-        if not raw:
-            return _DEFAULT_INBOUND_PROVIDER
+        content_type = request.headers.get("content-type", "")
 
-        if "application/json" in request.headers.get("content-type", ""):
+        if raw and "application/json" in content_type:
             payload = json.loads(raw)
             response = (
-                payload.get("response") if isinstance(payload, dict) else None
+                payload.get(_ENGAGELAB_ENVELOPE_KEY)
+                if isinstance(payload, dict)
+                else None
             )
             if isinstance(response, dict) and (
                 response.get("event") == "route" or "response_data" in response
             ):
-                return "engagelab"
-            return _DEFAULT_INBOUND_PROVIDER
+                detected = "engagelab"
+        elif raw:
+            form = await request.form()
+            # Envelope first: EngageLab nests the same field names SendCloud
+            # posts flat, so the wrapper is the only reliable discriminator.
+            if _ENGAGELAB_ENVELOPE_KEY in form:
+                detected = "engagelab"
+            elif any(key in form for key in _SENDCLOUD_KEYS):
+                detected = "sendcloud"
+    except Exception as exc:  # noqa: BLE001 - a failed guess must not fail the POST
+        request.app.state.log.warning(
+            "Could not inspect inbound payload to identify the provider: %s",
+            exc,
+        )
 
-        form = await request.form()
-        if all(key in form for key in _MAILGUN_SIGNATURE_KEYS):
-            return "mailgun"
-        if any(key in form for key in _MAILGUN_BODY_KEYS):
-            return "mailgun"
-        if all(key in form for key in _ELASTICEMAIL_KEYS):
-            return "elasticemail"
-        if "response" in form:
-            return "engagelab"
-    except Exception:  # noqa: BLE001 - a failed guess must not fail the POST
-        return _DEFAULT_INBOUND_PROVIDER
+    # Logged before returning either way, so a misrouted payload can be
+    # diagnosed from the field names alone.
+    _log_inbound_payload(request, raw, form, payload)
 
-    return _DEFAULT_INBOUND_PROVIDER
+    if explicit:
+        return explicit
+    if detected:
+        return detected
+
+    fallback = _fallback_inbound_provider(request)
+    flat = _has_flat_mail_fields(form, payload)
+    request.app.state.log.warning(
+        "Inbound POST matched no provider marker%s — falling back to '%s'. "
+        "Set INBOUND_DEFAULT_PROVIDER, or append ?provider=<key> to the "
+        "webhook URL in the provider dashboard, if that is wrong.",
+        " (flat from/to/subject payload)" if flat else "",
+        fallback,
+    )
+    return fallback
+
+
+def _has_flat_mail_fields(form, payload) -> bool:
+    """Report whether a payload carries top-level mail fields.
+
+    Args:
+        form: The parsed form mapping, or ``None``.
+        payload: The parsed JSON body, or ``None``.
+
+    Returns:
+        bool: ``True`` when any of :data:`_FLAT_MAIL_KEYS` is present at the
+            top level — i.e. the payload is definitively not EngageLab's
+            nested envelope.
+    """
+    if form is not None:
+        return any(key in form for key in _FLAT_MAIL_KEYS)
+    if isinstance(payload, dict):
+        return any(key in payload for key in _FLAT_MAIL_KEYS)
+    return False
 
 
 @router.post("/webhooks/rfq/inbound")
